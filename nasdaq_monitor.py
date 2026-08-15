@@ -1,43 +1,81 @@
 import datetime
 import os
-import io
 import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
-def fetch_fred_csv(series_id):
-    """FRED 공식 CSV 엔드포인트에서 데이터 다운로드"""
+def fetch_fred_api(series_id, api_key):
+    """FRED 공식 REST API를 통해 JSON 데이터 파싱"""
+    if not api_key:
+        return None
     try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_csv(io.StringIO(res.text))
-        df['DATE'] = pd.to_datetime(df['DATE'])
-        df[series_id] = pd.to_numeric(df[series_id], errors='coerce')
-        df = df.dropna().sort_values('DATE').reset_index(drop=True)
+        url = f"https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": series_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 100
+        }
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        
+        if "observations" not in data:
+            print(f"FRED API 에러 ({series_id}): {data.get('error_message', '')}")
+            return None
+
+        records = []
+        for obs in data["observations"]:
+            val = obs.get("value", ".")
+            if val != ".":
+                records.append({
+                    "DATE": pd.to_datetime(obs["date"]),
+                    series_id: float(val)
+                })
+        
+        df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
         return df
     except Exception as e:
-        print(f"FRED 데이터 수집 오류 ({series_id}): {e}")
+        print(f"FRED API 호출 오류 ({series_id}): {e}")
         return None
 
+def fetch_cboe_pcr():
+    """CBOE 공식 웹 일일 통계에서 Equity Put/Call Ratio 수집"""
+    try:
+        url = "https://cdn.cboe.com/data/us/options/market_statistics/daily/daily_market_statistics.csv"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=10)
+        lines = res.text.split('\n')
+        for line in lines:
+            if 'EQUITY' in line.upper() and 'PUT/CALL' in line.upper():
+                parts = line.split(',')
+                for p in parts:
+                    try:
+                        val = float(p.strip())
+                        if 0.2 < val < 3.0:
+                            return val
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return None
+
 def calculate_ultra_risk_score():
-    # ----------------------------------------------------
+    fred_api_key = os.environ.get("FRED_API_KEY", "")
+
     # 1. 시세 및 변동성 데이터 수집
-    # ----------------------------------------------------
     qqq = yf.download("QQQ", period="2y", interval="1d", progress=False)
     vxn = yf.download("^VXN", period="2mo", interval="1d", progress=False)
-    if vxn.empty:
+    if vxn.empty or len(vxn) < 20:
         vxn = yf.download("^VIX", period="2mo", interval="1d", progress=False)
 
-    # ----------------------------------------------------
-    # 2. 거시/신용/심리 데이터 (FRED)
-    # ----------------------------------------------------
-    df_hy = fetch_fred_csv("BAMLH0A0HYM2")       # 하이일드 스프레드
-    df_assets = fetch_fred_csv("WALCL")          # 연준 총자산
-    df_tga = fetch_fred_csv("WTREGEN")           # TGA 잔고
-    df_rrp = fetch_fred_csv("RRPONTSYD")         # 역레포 잔고
-    df_pcr = fetch_fred_csv("PCEPC")             # Equity Put/Call Ratio
+    # 2. FRED 공식 API 데이터 수집
+    df_hy = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)       # 하이일드 스프레드
+    df_assets = fetch_fred_api("WALCL", fred_api_key)          # 연준 총자산
+    df_tga = fetch_fred_api("WTREGEN", fred_api_key)           # TGA 잔고
+    df_rrp = fetch_fred_api("RRPONTSYD", fred_api_key)         # 역레포 잔고
+    df_pcr = fetch_fred_api("PCEPC", fred_api_key)             # FRED Equity PCR
 
     # ====================================================
     # [지표 1] 200일 & 50일 이격도 (10점)
@@ -66,7 +104,7 @@ def calculate_ultra_risk_score():
     score_rsi = float(np.clip((weekly_rsi - 50) * (10 / 30), 0, 10))
 
     # ====================================================
-    # [지표 3] 스마트머니 헤지 (VXN 다이버전스) (15점)
+    # [지표 3] 스마트머니 변동성 헤지: VXN (15점)
     # ====================================================
     vxn_current = float(vxn['Close'].iloc[-1])
     vxn_20d_ago = float(vxn['Close'].iloc[-20])
@@ -85,10 +123,10 @@ def calculate_ultra_risk_score():
         score_vxn = 5.0
         vxn_status = "⚠️ 변동성 극저점 (단기 안주)"
     else:
-        vxn_status = "🟢 안정"
+        vxn_status = "🟢 변동성 구조 안정"
 
     # ====================================================
-    # [지표 4] 내부 체력 (QQQ vs QQQE 괴리) (20점)
+    # [지표 4] 내부 체력 (QQQ vs QQQE) (20점)
     # ====================================================
     score_breadth = 0.0
     breadth_divergence = 0.0
@@ -116,21 +154,28 @@ def calculate_ultra_risk_score():
     score_pcr = 0.0
     pcr_val = 0.0
     pcr_10d = 0.0
-    if df_pcr is not None and len(df_pcr) >= 15:
+    if df_pcr is not None and len(df_pcr) >= 10:
         df_pcr['PCR_10MA'] = df_pcr['PCEPC'].rolling(10).mean()
         pcr_val = float(df_pcr['PCEPC'].iloc[-1])
         pcr_10d = float(df_pcr['PCR_10MA'].iloc[-1])
         score_pcr = float(np.clip((0.85 - pcr_10d) * (15 / 0.35), 0, 15))
+    else:
+        # Fallback: CBOE 웹 직접 조회
+        cboe_today = fetch_cboe_pcr()
+        if cboe_today:
+            pcr_val = cboe_today
+            pcr_10d = cboe_today
+            score_pcr = float(np.clip((0.85 - pcr_10d) * (15 / 0.35), 0, 15))
 
     # ====================================================
-    # [지표 6] 신용 리스크: BofA 하이일드 스프레드 (15점)
+    # [지표 6] 신용 리스크: 하이일드 스프레드 (15점)
     # ====================================================
     score_hy = 0.0
     hy_current = 0.0
     hy_change_20d = 0.0
     hy_status = "정상"
 
-    if df_hy is not None and len(df_hy) >= 25:
+    if df_hy is not None and len(df_hy) >= 20:
         hy_current = float(df_hy['BAMLH0A0HYM2'].iloc[-1])
         hy_20d_ago = float(df_hy['BAMLH0A0HYM2'].iloc[-20])
         hy_change_20d = (hy_current - hy_20d_ago) * 100
@@ -164,15 +209,16 @@ def calculate_ultra_risk_score():
             df_rrp_w = df_rrp.set_index('DATE').resample('W-WED').mean().reset_index()
             liq_df = pd.merge(m1, df_rrp_w, on='DATE', how='inner')
 
+            # WALCL(백만$), WTREGEN(백만$), RRPONTSYD(십억$) -> $B 단위 변환
             liq_df['Net_Liquidity'] = (liq_df['WALCL'] / 1000) - (liq_df['WTREGEN'] / 1000) - liq_df['RRPONTSYD']
             
             current_net_liq = float(liq_df['Net_Liquidity'].iloc[-1])
-            net_liq_4w_ago = float(liq_df['Net_Liquidity'].iloc[-5])
+            net_liq_4w_ago = float(liq_df['Net_Liquidity'].iloc[-5]) if len(liq_df) >= 5 else current_net_liq
             liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
 
-            fed_assets_curr = float(liq_df['WALCL'].iloc[-1]) / 1000  # $B
-            tga_curr = float(liq_df['WTREGEN'].iloc[-1]) / 1000       # $B
-            rrp_curr = float(liq_df['RRPONTSYD'].iloc[-1])            # $B
+            fed_assets_curr = float(liq_df['WALCL'].iloc[-1]) / 1000
+            tga_curr = float(liq_df['WTREGEN'].iloc[-1]) / 1000
+            rrp_curr = float(liq_df['RRPONTSYD'].iloc[-1])
 
             if qqq_20d_ret > 0 and liq_change_4w < -2.0:
                 score_liq = 15.0
@@ -183,8 +229,8 @@ def calculate_ultra_risk_score():
             else:
                 score_liq = 0.0
                 liq_status = "🟢 유동성 환경 양호"
-    except Exception:
-        score_liq = 0.0
+    except Exception as e:
+        print(f"유동성 연산 오류: {e}")
 
     # ====================================================
     # [종합 스코어링]
@@ -200,9 +246,6 @@ def calculate_ultra_risk_score():
     else:
         level = "🟢 <b>[안정 / 조정 구간]</b>"
 
-    # ====================================================
-    # [HTML 링크가 포함된 상세 리포트 생성]
-    # ====================================================
     report = (
         f"📊 <b>[QQQ 정밀 고점 판독 보고서]</b>\n"
         f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -247,8 +290,8 @@ def send_telegram_message(text):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",                # HTML 링크 렌더링 활성화
-        "disable_web_page_preview": True    # 메시지가 길어지지 않게 링크 미리보기 박스 비활성화
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
     response = requests.post(url, data=payload)
     if response.status_code == 200:
