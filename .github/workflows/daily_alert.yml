@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 기준 00:00 = 한국 시간(KST) 매일 오전 9:00
     - cron: '0 0 * * *'
-  workflow_dispatch: # 웹에서 수동 실행 버튼을 활성화하는 옵션
+  workflow_dispatch:
 
 jobs:
   run-risk-analyzer:
@@ -26,5 +26,6 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python nasdaq_monitor.py
