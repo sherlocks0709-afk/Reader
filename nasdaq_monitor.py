@@ -21,49 +21,97 @@ def fetch_fred_csv(series_id):
         print(f"FRED 데이터 수집 오류 ({series_id}): {e}")
         return None
 
-def calculate_master_risk_score():
+def calculate_ultra_risk_score():
     # ----------------------------------------------------
-    # 1. QQQ 및 VIX 데이터 수집 (야후 파이낸스)
+    # 1. 시세 및 변동성 데이터 수집
     # ----------------------------------------------------
     qqq = yf.download("QQQ", period="2y", interval="1d", progress=False)
-    vix = yf.download("^VIX", period="1mo", interval="1d", progress=False)
-    vix_close = float(vix['Close'].iloc[-1])
+    vxn = yf.download("^VXN", period="2mo", interval="1d", progress=False)
+    if vxn.empty:
+        vxn = yf.download("^VIX", period="2mo", interval="1d", progress=False)
 
     # ----------------------------------------------------
-    # 2. 거시 유동성 & 신용 & 풋콜 지표 수집 (FRED)
+    # 2. 거시/신용/심리 데이터 (FRED)
     # ----------------------------------------------------
     df_hy = fetch_fred_csv("BAMLH0A0HYM2")       # 하이일드 스프레드
-    df_assets = fetch_fred_csv("WALCL")          # 연준 총자산 (주간)
-    df_tga = fetch_fred_csv("WTREGEN")           # TGA 잔고 (주간)
-    df_rrp = fetch_fred_csv("RRPONTSYD")         # 역레포 잔고 (일간)
-    df_pcr = fetch_fred_csv("PCEPC")             # CBOE Equity Put/Call Ratio
+    df_assets = fetch_fred_csv("WALCL")          # 연준 총자산
+    df_tga = fetch_fred_csv("WTREGEN")           # TGA 잔고
+    df_rrp = fetch_fred_csv("RRPONTSYD")         # 역레포 잔고
+    df_pcr = fetch_fred_csv("PCEPC")             # Equity Put/Call Ratio
 
     # ====================================================
-    # [지표 1] QQQ 200일 이격도 (15점)
+    # [지표 1] 200일 & 50일 이격도 (10점)
     # ====================================================
     qqq['SMA200'] = qqq['Close'].rolling(window=200).mean()
+    qqq['SMA50'] = qqq['Close'].rolling(window=50).mean()
     current_close = float(qqq['Close'].iloc[-1])
     sma200 = float(qqq['SMA200'].iloc[-1])
-    disparity_200 = (current_close / sma200) * 100
-    score_disp = float(np.clip((disparity_200 - 100) * (15 / 20), 0, 15))
+    sma50 = float(qqq['SMA50'].iloc[-1])
+
+    disp_200 = (current_close / sma200) * 100
+    disp_50 = (current_close / sma50) * 100
+
+    s_d200 = float(np.clip((disp_200 - 100) * (5 / 20), 0, 5))
+    s_d50 = float(np.clip((disp_50 - 100) * (5 / 8), 0, 5))
+    score_disp = s_d200 + s_d50
 
     # ====================================================
-    # [지표 2] QQQ 주봉 RSI(14) (15점)
+    # [지표 2] 주봉 RSI(14) (10점)
     # ====================================================
     qqq_w = qqq['Close'].resample('W-FRI').last()
     delta_w = qqq_w.diff()
     gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean()
     loss_w = (-delta_w.where(delta_w < 0, 0)).rolling(window=14).mean()
     weekly_rsi = float((100 - (100 / (1 + (gain_w / loss_w)))).iloc[-1])
-    score_rsi = float(np.clip((weekly_rsi - 50) * (15 / 30), 0, 15))
+    score_rsi = float(np.clip((weekly_rsi - 50) * (10 / 30), 0, 10))
 
     # ====================================================
-    # [지표 3-1] CBOE VIX 지수 (10점)
+    # [지표 3] 스마트머니 헤지 (VXN 다이버전스) (15점)
     # ====================================================
-    score_vix = float(np.clip((20 - vix_close) * (10 / 8), 0, 10))
+    vxn_current = float(vxn['Close'].iloc[-1])
+    vxn_20d_ago = float(vxn['Close'].iloc[-20])
+    vxn_change_20d = vxn_current - vxn_20d_ago
+    qqq_20d_ret = ((current_close / float(qqq['Close'].iloc[-20])) - 1) * 100
+
+    score_vxn = 0.0
+    vxn_status = "정상"
+    if qqq_20d_ret > 0 and vxn_change_20d >= 2.0:
+        score_vxn = 15.0
+        vxn_status = "🚨 스마트머니 풋 매집 (동반상승)"
+    elif qqq_20d_ret > 0 and vxn_change_20d >= 0.5:
+        score_vxn = 7.5
+        vxn_status = "⚠️ 변동성 지수 지지 조짐"
+    elif vxn_current <= 14.0:
+        score_vxn = 5.0
+        vxn_status = "⚠️ 변동성 극저점 (단기 안주)"
+    else:
+        vxn_status = "🟢 안정"
 
     # ====================================================
-    # [지표 3-2] Equity Put/Call Ratio 10D MA (15점)
+    # [지표 4] 내부 체력 (QQQ vs QQQE 괴리) (20점)
+    # ====================================================
+    score_breadth = 0.0
+    breadth_divergence = 0.0
+    breadth_status = "고른 상승"
+    try:
+        qqqe = yf.download("QQQE", period="2mo", interval="1d", progress=False)
+        qqqe_ret_20d = ((float(qqqe['Close'].iloc[-1]) / float(qqqe['Close'].iloc[-20])) - 1) * 100
+        breadth_divergence = qqq_20d_ret - qqqe_ret_20d
+
+        if qqq_20d_ret > 0 and breadth_divergence >= 4.0:
+            score_breadth = 20.0
+            breadth_status = "🚨 대형주 쏠림 심화 (대다수 하락)"
+        elif qqq_20d_ret > 0 and breadth_divergence >= 2.0:
+            score_breadth = 10.0
+            breadth_status = "⚠️ 상승 종목 수 축소"
+        else:
+            score_breadth = 0.0
+            breadth_status = "🟢 시장 전반 양호"
+    except Exception:
+        score_breadth = 0.0
+
+    # ====================================================
+    # [지표 5] 옵션 심리: Equity Put/Call Ratio (15점)
     # ====================================================
     score_pcr = 0.0
     pcr_val = 0.0
@@ -72,14 +120,12 @@ def calculate_master_risk_score():
         df_pcr['PCR_10MA'] = df_pcr['PCEPC'].rolling(10).mean()
         pcr_val = float(df_pcr['PCEPC'].iloc[-1])
         pcr_10d = float(df_pcr['PCR_10MA'].iloc[-1])
-        # 0.85 이상: 0점, 0.50 이하(극단적 낙관): 15점 만점
         score_pcr = float(np.clip((0.85 - pcr_10d) * (15 / 0.35), 0, 15))
 
     # ====================================================
-    # [지표 4] 하이일드 스프레드 & 크레딧 다이버전스 (20점)
+    # [지표 6] 신용 리스크: BofA 하이일드 스프레드 (15점)
     # ====================================================
-    score_hy_abs = 0.0
-    score_hy_div = 0.0
+    score_hy = 0.0
     hy_current = 0.0
     hy_change_20d = 0.0
     hy_status = "정상"
@@ -89,30 +135,24 @@ def calculate_master_risk_score():
         hy_20d_ago = float(df_hy['BAMLH0A0HYM2'].iloc[-20])
         hy_change_20d = (hy_current - hy_20d_ago) * 100
 
-        # 절대치 저점 (10점 만점: 4.5%~3.0%)
-        score_hy_abs = float(np.clip((4.5 - hy_current) * (10 / 1.5), 0, 10))
-
-        # 크레딧 다이버전스 (10점 만점)
-        qqq_close_20d = float(qqq['Close'].iloc[-20])
-        qqq_ret_20d = ((current_close / qqq_close_20d) - 1) * 100
-
-        if qqq_ret_20d > 0 and hy_change_20d >= 20:
-            score_hy_div = 10.0
-            hy_status = "🚨 크레딧 다이버전스 (스프레드 확대)"
-        elif qqq_ret_20d > 0 and hy_change_20d >= 10:
-            score_hy_div = 5.0
-            hy_status = "⚠️ 스프레드 미세 반등"
+        s_hy_abs = float(np.clip((4.5 - hy_current) * (7.5 / 1.5), 0, 7.5))
+        s_hy_div = 0.0
+        if qqq_20d_ret > 0 and hy_change_20d >= 20:
+            s_hy_div = 7.5
+            hy_status = "🚨 크레딧 다이버전스"
+        elif qqq_20d_ret > 0 and hy_change_20d >= 10:
+            s_hy_div = 3.5
+            hy_status = "⚠️ 스프레드 반등 조짐"
         else:
             hy_status = "🟢 신용시장 안정"
-
-    score_hy_total = score_hy_abs + score_hy_div
+        score_hy = s_hy_abs + s_hy_div
 
     # ====================================================
-    # [지표 5] 연준 순유동성 (Fed Assets - TGA - RRP) (25점)
+    # [지표 7] 거시 순유동성 (Fed Assets - TGA - RRP) (15점)
     # ====================================================
-    score_liq_div = 0.0
-    score_liq_trend = 0.0
+    score_liq = 0.0
     current_net_liq = 0.0
+    fed_assets_curr = 0.0
     tga_curr = 0.0
     rrp_curr = 0.0
     liq_change_4w = 0.0
@@ -120,81 +160,78 @@ def calculate_master_risk_score():
 
     try:
         if df_assets is not None and df_tga is not None and df_rrp is not None:
-            # 주간 데이터 기준 병합
             m1 = pd.merge(df_assets, df_tga, on='DATE', how='inner')
-            # RRP 일간 데이터를 주간 평균으로 리샘플링 후 병합
             df_rrp_w = df_rrp.set_index('DATE').resample('W-WED').mean().reset_index()
             liq_df = pd.merge(m1, df_rrp_w, on='DATE', how='inner')
 
-            # 순유동성 계산 ($ Billions 단위 변환)
-            # WALCL(백만$), WTREGEN(백만$), RRPONTSYD(십억$)
             liq_df['Net_Liquidity'] = (liq_df['WALCL'] / 1000) - (liq_df['WTREGEN'] / 1000) - liq_df['RRPONTSYD']
             
             current_net_liq = float(liq_df['Net_Liquidity'].iloc[-1])
             net_liq_4w_ago = float(liq_df['Net_Liquidity'].iloc[-5])
             liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
 
-            tga_curr = float(liq_df['WTREGEN'].iloc[-1]) / 1000  # $B
-            rrp_curr = float(liq_df['RRPONTSYD'].iloc[-1])       # $B
+            fed_assets_curr = float(liq_df['WALCL'].iloc[-1]) / 1000  # $B
+            tga_curr = float(liq_df['WTREGEN'].iloc[-1]) / 1000       # $B
+            rrp_curr = float(liq_df['RRPONTSYD'].iloc[-1])            # $B
 
-            # 5-1. 유동성 다이버전스 (15점): QQQ 4주 상승 vs 유동성 4주 감소
-            qqq_close_4w = float(qqq['Close'].iloc[-20])
-            qqq_ret_4w = ((current_close / qqq_close_4w) - 1) * 100
-
-            if qqq_ret_4w > 0 and liq_change_4w < -2.0:
-                score_liq_div = 15.0
-                liq_status = "🚨 유동성 다이버전스 (유동성 흡수 중)"
-            elif qqq_ret_4w > 0 and liq_change_4w < 0:
-                score_liq_div = 7.5
-                liq_status = "⚠️ 유동성 정체 국면"
+            if qqq_20d_ret > 0 and liq_change_4w < -2.0:
+                score_liq = 15.0
+                liq_status = "🚨 유동성 다이버전스 (흡수)"
+            elif qqq_20d_ret > 0 and liq_change_4w < 0:
+                score_liq = 7.5
+                liq_status = "⚠️ 유동성 정체"
             else:
+                score_liq = 0.0
                 liq_status = "🟢 유동성 환경 양호"
-
-            # 5-2. 4주 유동성 급감 점수 (10점): 0%~ -5% 감소율 반영
-            if liq_change_4w < 0:
-                score_liq_trend = float(np.clip(abs(liq_change_4w) * (10 / 5.0), 0, 10))
-
-    except Exception as e:
-        print(f"유동성 계산 오류: {e}")
-
-    score_liq_total = score_liq_div + score_liq_trend
+    except Exception:
+        score_liq = 0.0
 
     # ====================================================
     # [종합 스코어링]
     # ====================================================
-    total_score = round(score_disp + score_rsi + score_vix + score_pcr + score_hy_total + score_liq_total, 1)
+    total_score = round(score_disp + score_rsi + score_vxn + score_breadth + score_pcr + score_hy + score_liq, 1)
 
     if total_score >= 80:
-        level = "🚨 [극단적 과열 / 고점 경보] - 분할 익절 및 헤지 권고"
+        level = "🚨 <b>[극단적 과열 / 고점 경보]</b>"
     elif total_score >= 65:
-        level = "⚠️ [과열 주의 구간] - 신규 공격 매수 자제"
+        level = "⚠️ <b>[과열 주의 구간]</b>"
     elif total_score >= 40:
-        level = "⚖️ [중립 / 건전한 추세]"
+        level = "⚖️ <b>[중립 / 건전한 추세]</b>"
     else:
-        level = "🟢 [안정 / 조정 및 저평가 구간]"
+        level = "🟢 <b>[안정 / 조정 구간]</b>"
 
-    # 보고서 텍스트 생성
+    # ====================================================
+    # [HTML 링크가 포함된 상세 리포트 생성]
+    # ====================================================
     report = (
-        f"📊 [QQQ 정밀 고점 판독 종합 보고서]\n"
+        f"📊 <b>[QQQ 정밀 고점 판독 보고서]</b>\n"
         f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"💰 QQQ 종가: ${current_close:.2f}\n"
+        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가</a>: <b>${current_close:.2f}</b>\n"
+        f"   └ 200일선: ${sma200:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
-        f"📈 [5대 계층 세부 지표 분석]\n"
-        f"1. 200일선 이격도: {disparity_200:.2f}% ({score_disp:.1f}/15점)\n"
-        f"2. 주봉 RSI(14): {weekly_rsi:.2f} ({score_rsi:.1f}/15점)\n"
-        f"3. 심리/파생:\n"
-        f"   • CBOE VIX: {vix_close:.2f} ({score_vix:.1f}/10점)\n"
-        f"   • Equity Put/Call 10D: {pcr_10d:.2f} ({score_pcr:.1f}/15점)\n"
-        f"4. 신용 리스크 (BofA HY):\n"
-        f"   • 스프레드: {hy_current:.2f}% (20D 변동: {hy_change_20d:+.1f}bp)\n"
-        f"   • 상태: {hy_status} ({score_hy_total:.1f}/20점)\n"
-        f"5. 거시 순유동성:\n"
-        f"   • Net Liquidity: ${current_net_liq:.1f}B (4주: {liq_change_4w:+.2f}%)\n"
-        f"   • TGA: ${tga_curr:.1f}B | RRP: ${rrp_curr:.1f}B\n"
-        f"   • 상태: {liq_status} ({score_liq_total:.1f}/25점)\n"
+        f"📈 <b>[세부 지표 및 원시 데이터]</b>\n\n"
+        f"1. <b>가격 이격도</b> ({score_disp:.1f}/10점)\n"
+        f"   • 200일: <b>{disp_200:.1f}%</b> | 50일: <b>{disp_50:.1f}%</b>\n\n"
+        f"2. <b>모멘텀 (RSI)</b> ({score_rsi:.1f}/10점)\n"
+        f"   • 주봉 RSI(14): <b>{weekly_rsi:.1f}</b>\n\n"
+        f"3. <a href='https://finance.yahoo.com/quote/%5EVXN'><b>나스닥 변동성 (VXN)</b></a> ({score_vxn:.1f}/15점)\n"
+        f"   • 현재값: <b>{vxn_current:.2f}</b> (20D 변동: {vxn_change_20d:+.2f})\n"
+        f"   • 상태: {vxn_status}\n\n"
+        f"4. <a href='https://finance.yahoo.com/quote/QQQE'><b>내부 체력 (QQQ vs QQQE)</b></a> ({score_breadth:.1f}/20점)\n"
+        f"   • 20D 수익률 괴리: <b>{breadth_divergence:+.2f}%p</b>\n"
+        f"   • 상태: {breadth_status}\n\n"
+        f"5. <a href='https://fred.stlouisfed.org/series/PCEPC'><b>Equity Put/Call Ratio</b></a> ({score_pcr:.1f}/15점)\n"
+        f"   • 10일 평균: <b>{pcr_10d:.2f}</b> (최근값: {pcr_val:.2f})\n\n"
+        f"6. <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'><b>하이일드 스프레드 (HY OAS)</b></a> ({score_hy:.1f}/15점)\n"
+        f"   • 현재 스프레드: <b>{hy_current:.2f}%</b> (20D: {hy_change_20d:+.1f}bp)\n"
+        f"   • 상태: {hy_status}\n\n"
+        f"7. <b>연준 순유동성 지표</b> ({score_liq:.1f}/15점)\n"
+        f"   • Net Liq: <b>${current_net_liq:.1f}B</b> (4주: {liq_change_4w:+.2f}%)\n"
+        f"   • <a href='https://fred.stlouisfed.org/series/WALCL'>Fed자산</a>: ${fed_assets_curr:.1f}B | <a href='https://fred.stlouisfed.org/series/WTREGEN'>TGA</a>: ${tga_curr:.1f}B | <a href='https://fred.stlouisfed.org/series/RRPONTSYD'>RRP</a>: ${rrp_curr:.1f}B\n"
+        f"   • 상태: {liq_status}\n"
         f"────────────────\n"
-        f"🎯 종합 위험도 점수: {total_score} / 100점\n"
-        f"현재 상태: {level}"
+        f"🎯 <b>종합 위험도 점수: {total_score} / 100점</b>\n"
+        f"판정: {level}"
     )
     return report
 
@@ -209,7 +246,9 @@ def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "HTML",                # HTML 링크 렌더링 활성화
+        "disable_web_page_preview": True    # 메시지가 길어지지 않게 링크 미리보기 박스 비활성화
     }
     response = requests.post(url, data=payload)
     if response.status_code == 200:
@@ -218,6 +257,6 @@ def send_telegram_message(text):
         print(f"전송 실패 ({response.status_code}): {response.text}")
 
 if __name__ == "__main__":
-    msg = calculate_master_risk_score()
+    msg = calculate_ultra_risk_score()
     print(msg)
     send_telegram_message(msg)
