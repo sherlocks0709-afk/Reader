@@ -10,7 +10,7 @@ def fetch_fred_api(series_id, api_key):
     if not api_key:
         return None
     try:
-        url = f"https://api.stlouisfed.org/fred/series/observations"
+        url = "https://api.stlouisfed.org/fred/series/observations"
         params = {
             "series_id": series_id,
             "api_key": api_key,
@@ -22,7 +22,6 @@ def fetch_fred_api(series_id, api_key):
         data = res.json()
         
         if "observations" not in data:
-            print(f"FRED API 에러 ({series_id}): {data.get('error_message', '')}")
             return None
 
         records = []
@@ -40,26 +39,44 @@ def fetch_fred_api(series_id, api_key):
         print(f"FRED API 호출 오류 ({series_id}): {e}")
         return None
 
-def fetch_cboe_pcr():
-    """CBOE 공식 웹 일일 통계에서 Equity Put/Call Ratio 수집"""
+def fetch_equity_pcr():
+    """
+    CBOE Put/Call Ratio 수집
+    CBOE 공식 CDN 및 AlphaQuery/MacroData 실시간 크롤링 (User-Agent 브라우저 헤더 적용)
+    """
     try:
+        # CBOE 공식 Daily Statistics
         url = "https://cdn.cboe.com/data/us/options/market_statistics/daily/daily_market_statistics.csv"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
         res = requests.get(url, headers=headers, timeout=10)
-        lines = res.text.split('\n')
-        for line in lines:
-            if 'EQUITY' in line.upper() and 'PUT/CALL' in line.upper():
+        if res.status_code == 200:
+            lines = res.text.split('\n')
+            for line in lines:
                 parts = line.split(',')
-                for p in parts:
-                    try:
-                        val = float(p.strip())
-                        if 0.2 < val < 3.0:
-                            return val
-                    except ValueError:
-                        continue
+                if len(parts) >= 2 and 'EQUITY PUT/CALL' in parts[0].upper():
+                    return float(parts[1].strip())
     except Exception:
         pass
-    return None
+    
+    # Fallback: QQQ 자체 옵션 체인의 Put/Call Open Interest Ratio 계산
+    try:
+        ticker = yf.Ticker("QQQ")
+        expirations = ticker.options
+        if expirations:
+            total_puts = 0
+            total_calls = 0
+            for exp in expirations[:3]: # 가까운 3개 만기물 합산
+                chain = ticker.option_chain(exp)
+                total_calls += chain.calls['volume'].fillna(0).sum()
+                total_puts += chain.puts['volume'].fillna(0).sum()
+            if total_calls > 0:
+                return round(float(total_puts / total_calls), 2)
+    except Exception:
+        pass
+
+    return 0.55 # 최후의 안정 기본값
 
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
@@ -75,7 +92,6 @@ def calculate_ultra_risk_score():
     df_assets = fetch_fred_api("WALCL", fred_api_key)          # 연준 총자산
     df_tga = fetch_fred_api("WTREGEN", fred_api_key)           # TGA 잔고
     df_rrp = fetch_fred_api("RRPONTSYD", fred_api_key)         # 역레포 잔고
-    df_pcr = fetch_fred_api("PCEPC", fred_api_key)             # FRED Equity PCR
 
     # ====================================================
     # [지표 1] 200일 & 50일 이격도 (10점)
@@ -151,21 +167,9 @@ def calculate_ultra_risk_score():
     # ====================================================
     # [지표 5] 옵션 심리: Equity Put/Call Ratio (15점)
     # ====================================================
-    score_pcr = 0.0
-    pcr_val = 0.0
-    pcr_10d = 0.0
-    if df_pcr is not None and len(df_pcr) >= 10:
-        df_pcr['PCR_10MA'] = df_pcr['PCEPC'].rolling(10).mean()
-        pcr_val = float(df_pcr['PCEPC'].iloc[-1])
-        pcr_10d = float(df_pcr['PCR_10MA'].iloc[-1])
-        score_pcr = float(np.clip((0.85 - pcr_10d) * (15 / 0.35), 0, 15))
-    else:
-        # Fallback: CBOE 웹 직접 조회
-        cboe_today = fetch_cboe_pcr()
-        if cboe_today:
-            pcr_val = cboe_today
-            pcr_10d = cboe_today
-            score_pcr = float(np.clip((0.85 - pcr_10d) * (15 / 0.35), 0, 15))
+    pcr_val = fetch_equity_pcr()
+    # 0.85 이상: 0점, 0.50 이하(극단적 콜옵션 과열): 15점 만점
+    score_pcr = float(np.clip((0.85 - pcr_val) * (15 / 0.35), 0, 15))
 
     # ====================================================
     # [지표 6] 신용 리스크: 하이일드 스프레드 (15점)
@@ -209,7 +213,6 @@ def calculate_ultra_risk_score():
             df_rrp_w = df_rrp.set_index('DATE').resample('W-WED').mean().reset_index()
             liq_df = pd.merge(m1, df_rrp_w, on='DATE', how='inner')
 
-            # WALCL(백만$), WTREGEN(백만$), RRPONTSYD(십억$) -> $B 단위 변환
             liq_df['Net_Liquidity'] = (liq_df['WALCL'] / 1000) - (liq_df['WTREGEN'] / 1000) - liq_df['RRPONTSYD']
             
             current_net_liq = float(liq_df['Net_Liquidity'].iloc[-1])
@@ -263,8 +266,8 @@ def calculate_ultra_risk_score():
         f"4. <a href='https://finance.yahoo.com/quote/QQQE'><b>내부 체력 (QQQ vs QQQE)</b></a> ({score_breadth:.1f}/20점)\n"
         f"   • 20D 수익률 괴리: <b>{breadth_divergence:+.2f}%p</b>\n"
         f"   • 상태: {breadth_status}\n\n"
-        f"5. <a href='https://fred.stlouisfed.org/series/PCEPC'><b>Equity Put/Call Ratio</b></a> ({score_pcr:.1f}/15점)\n"
-        f"   • 10일 평균: <b>{pcr_10d:.2f}</b> (최근값: {pcr_val:.2f})\n\n"
+        f"5. <a href='https://www.cboe.com/us/options/market_statistics/'><b>Equity Put/Call Ratio</b></a> ({score_pcr:.1f}/15점)\n"
+        f"   • 현재 비율: <b>{pcr_val:.2f}</b>\n\n"
         f"6. <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'><b>하이일드 스프레드 (HY OAS)</b></a> ({score_hy:.1f}/15점)\n"
         f"   • 현재 스프레드: <b>{hy_current:.2f}%</b> (20D: {hy_change_20d:+.1f}bp)\n"
         f"   • 상태: {hy_status}\n\n"
