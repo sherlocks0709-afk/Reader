@@ -87,13 +87,15 @@ def fetch_equity_pcr():
 
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
-    data_warnings = []  # 전체 지표 오류 및 고정 감지 리스트
+    data_warnings = []     # 데이터 결측/품질 경보
+    regime_alerts = []     # 시장 체제 변화(Regime Shift) 알고리즘 보정 알림
 
-    # 1. 시세 및 선물 다운로드
+    # 1. 시세, 선물 및 신규 0DTE 지표(^VIX1D) 다운로드
     qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
     tqqq = yf.download("TQQQ", period="1y", interval="1d", progress=False, auto_adjust=False)
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
     vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
+    vix1d = yf.download("^VIX1D", period="2mo", interval="1d", progress=False, auto_adjust=False)
     vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False, auto_adjust=False)
     vix3m = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
     skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
@@ -118,7 +120,6 @@ def calculate_ultra_risk_score():
     else:
         vxn_close_s = clean_series(vxn['Close'])
 
-    # VIX3M 결측치 검증
     if not vix3m.empty and len(vix3m) >= 5:
         vix3m_close_s = clean_series(vix3m['Close'])
     else:
@@ -221,11 +222,26 @@ def calculate_ultra_risk_score():
     else:
         vxn_status = "🟢 변동성 안정"
 
-    # 지표 3-2: SKEW
+    # 지표 3-2: SKEW 및 체제변화(0DTE / VIX1D) 통합 검증
     skew_current = float(skew_close_s.iloc[-1])
     if np.isnan(skew_current): skew_current = 125.0
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
-    skew_status = "🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상"
+    
+    # [체제 1 반영: 0DTE VIX1D 단기 투기 과열 감지]
+    vix1d_val = 0.0
+    vix1d_tag = ""
+    vix_current_val = float(vix_close_s.iloc[-1])
+    if not vix1d.empty and len(vix1d) >= 5:
+        vix1d_s = clean_series(vix1d['Close'])
+        vix1d_val = float(vix1d_s.iloc[-1])
+        if vix_current_val > 0:
+            ratio_0dte = vix1d_val / vix_current_val
+            if ratio_0dte >= 1.25:
+                score_skew = min(10.0, score_skew + 3.0)  # 0DTE 과열 가산
+                vix1d_tag = f" (🔥0DTE급등 {ratio_0dte:.2f}x)"
+                if ratio_0dte >= 1.40:
+                    regime_alerts.append(f"0DTE 옵션 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x) 👉 초단기 파생 포지션 왜곡 점검 필요")
+    skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
 
     # 지표 3-3: 기간구조
     vix_val = float(vix_close_s.iloc[-1])
@@ -237,20 +253,34 @@ def calculate_ultra_risk_score():
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 4: QQQ vs QQQE 쏠림
+    # 지표 4: QQQ vs QQQE 쏠림 [체제 3 반영: 동적 Z-Score 연산]
     score_breadth = 0.0
     breadth_divergence = 0.0
     try:
-        qqqe = yf.download("QQQE", period="2mo", interval="1d", progress=False, auto_adjust=False)
+        qqqe = yf.download("QQQE", period="6mo", interval="1d", progress=False, auto_adjust=False)
         if not qqqe.empty:
             qqqe_close = clean_series(qqqe['Close'])
             qqqe_ref = float(qqqe_close.iloc[-20]) if len(qqqe_close) >= 20 else float(qqqe_close.iloc[0])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
             breadth_divergence = qqq_20d_ret - qqqe_ret_20d
-            if qqq_20d_ret > 0 and breadth_divergence >= 4.0:
-                score_breadth = 15.0
-            elif qqq_20d_ret > 0 and breadth_divergence >= 2.0:
-                score_breadth = 7.5
+            
+            # 60일 롤링 쏠림도 표준편차 기반 동적 적응
+            qqq_roll_20 = qqq_close.pct_change(20) * 100
+            qqqe_roll_20 = qqqe_close.pct_change(20) * 100
+            diff_series = (qqq_roll_20 - qqqe_roll_20).dropna()
+            if len(diff_series) >= 40:
+                diff_mean = float(diff_series.mean())
+                diff_std = float(diff_series.std())
+                z_breadth = (breadth_divergence - diff_mean) / diff_std if diff_std > 0 else 0.0
+                if qqq_20d_ret > 0 and z_breadth >= 2.0:
+                    score_breadth = 15.0
+                elif qqq_20d_ret > 0 and z_breadth >= 1.0:
+                    score_breadth = 7.5
+                if abs(z_breadth) >= 2.8:
+                    regime_alerts.append(f"빅테크 vs 동일가중 쏠림도 임계 돌파 ({z_breadth:+.2f}σ) 👉 지수 양극화 체제 변화 점검 필요")
+            else:
+                if qqq_20d_ret > 0 and breadth_divergence >= 4.0: score_breadth = 15.0
+                elif qqq_20d_ret > 0 and breadth_divergence >= 2.0: score_breadth = 7.5
         else:
             data_warnings.append("⚠️ QQQE(동일가중) 데이터 수신 누락")
     except Exception:
@@ -279,7 +309,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[API대체]"
 
-    # 지표 7: 순유동성
+    # 지표 7: 순유동성 [체제 2 반영: 유동성 동행성 자가검증]
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -310,6 +340,14 @@ def calculate_ultra_risk_score():
             else:
                 score_liq = 0.0
                 liq_status = "🟢 양호"
+
+            # 유동성과 지수 동행성 체제 진단 (60일 상관관계 역전 감지)
+            if len(liq_df) >= 20 and len(qqq_close) >= 100:
+                merged_check = pd.merge_asof(qqq.reset_index(), liq_df[['DATE', 'Net_Liquidity']], left_on='Date', right_on='DATE').dropna()
+                if len(merged_check) >= 40:
+                    corr_val = merged_check['Close'].tail(40).corr(merged_check['Net_Liquidity'].tail(40))
+                    if corr_val <= -0.65:
+                        regime_alerts.append(f"연준 순유동성 vs QQQ 상관계수 역전 (Corr: {corr_val:.2f}) 👉 특수 대출/재정정책 유동성 왜곡 점검 필요")
     except Exception:
         liq_date_str = " ⚠️[API대체]"
 
@@ -429,15 +467,25 @@ def calculate_ultra_risk_score():
             f"📙 <b>[TQQQ 3배수 기관급 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
 
-    # 데이터 품질/이상 경보 배너 생성
+    # 1. 데이터 품질 경보 배너
     warning_banner = ""
     if data_warnings:
         warning_banner = "🚨 <b>[데이터 품질/수집 경보]</b>\n" + "\n".join([f"• {w}" for w in data_warnings]) + "\n────────────────\n"
+
+    # 2. 시장 체제 변화(Regime Shift) 알고리즘 보정 배너
+    regime_banner = ""
+    if regime_alerts:
+        regime_banner = (
+            "⚙️ <b>[시장 체제 변화 감지 — 알고리즘 보정 회의 권장]</b>\n" +
+            "\n".join([f"• {a}" for a in regime_alerts]) +
+            "\n👉 <i>지표 간 구조적 괴리가 발생했으므로 가중치 보정 회의를 권장합니다.</i>\n────────────────\n"
+        )
 
     report = (
         f"📊 <b>[QQQ & TQQQ 듀얼 전략 정밀 판독기]</b>\n"
         f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         f"{warning_banner}"
+        f"{regime_banner}"
         f"{fut_gap_status}"
         f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
         f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
@@ -453,7 +501,7 @@ def calculate_ultra_risk_score():
         f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
         f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://finance.yahoo.com/quote/%5EVIX3M'>기간구조</a>: {vix_ratio:.2f}\n"
-        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p\n"
+        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth if 'z_breadth' in locals() else 0.0:+.2f}σ)\n"
         f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{pcr_tag}\n"
         f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{hy_tag} ({hy_status})\n"
         f"• 순유동성: ${current_net_liq:.1f}B ({liq_change_4w:+.2f}%){liq_date_str}"
