@@ -18,7 +18,7 @@ def clean_series(df_col):
 def fetch_fred_api(series_id, api_key):
     """FRED 공식 REST API 및 최종 데이터 일자 확인"""
     if not api_key:
-        return None, None
+        return None, None, False
     try:
         url = "https://api.stlouisfed.org/fred/series/observations"
         params = {
@@ -31,7 +31,7 @@ def fetch_fred_api(series_id, api_key):
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
         if "observations" not in data or not data["observations"]:
-            return None, None
+            return None, None, False
 
         records = []
         for obs in data["observations"]:
@@ -43,10 +43,12 @@ def fetch_fred_api(series_id, api_key):
                 })
         df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
         last_date = df["DATE"].iloc[-1]
-        return df, last_date
+        days_lag = (datetime.datetime.now() - last_date).days
+        is_stale = (days_lag > 7)
+        return df, last_date, is_stale
     except Exception as e:
         print(f"FRED 에러 ({series_id}): {e}")
-        return None, None
+        return None, None, False
 
 def fetch_equity_pcr():
     """CBOE 공식 웹/CSV에서 순수 Equity Put/Call Ratio 추출"""
@@ -85,6 +87,7 @@ def fetch_equity_pcr():
 
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
+    data_warnings = []  # 전체 지표 오류 및 고정 감지 리스트
 
     # 1. 시세 및 선물 다운로드
     qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
@@ -95,24 +98,49 @@ def calculate_ultra_risk_score():
     vix3m = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
     skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
 
-    qqq_close = clean_series(qqq['Close'])
-    tqqq_close = clean_series(tqqq['Close']) if not tqqq.empty else qqq_close
-    vix_close_s = clean_series(vix['Close']) if not vix.empty else pd.Series([18.0]*len(qqq_close), index=qqq_close.index)
-    vxn_close_s = clean_series(vxn['Close']) if (not vxn.empty and len(vxn) >= 20) else vix_close_s
+    if qqq.empty or len(qqq) < 50:
+        data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
+        qqq_close = pd.Series([700.0] * 100)
+    else:
+        qqq_close = clean_series(qqq['Close'])
 
-    # VIX3M 결측치 방어
+    tqqq_close = clean_series(tqqq['Close']) if not tqqq.empty else qqq_close
+    
+    if vix.empty:
+        data_warnings.append("⚠️ VIX 지수 누락 (18.0 기본값 적용)")
+        vix_close_s = pd.Series([18.0] * len(qqq_close), index=qqq_close.index)
+    else:
+        vix_close_s = clean_series(vix['Close'])
+
+    if vxn.empty or len(vxn) < 20:
+        data_warnings.append("⚠️ VXN 나스닥 변동성 누락 (VIX 대체)")
+        vxn_close_s = vix_close_s
+    else:
+        vxn_close_s = clean_series(vxn['Close'])
+
+    # VIX3M 결측치 검증
     if not vix3m.empty and len(vix3m) >= 5:
         vix3m_close_s = clean_series(vix3m['Close'])
     else:
+        data_warnings.append("⚠️ VIX3M 3개월물 누락 (기간구조 임의 추정)")
         vix3m_close_s = vix_close_s * 1.1
 
-    skew_close_s = clean_series(skew['Close']) if not skew.empty else pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
+    if skew.empty:
+        data_warnings.append("⚠️ SKEW 꼬리위험 지수 누락 (125.0 기본값 적용)")
+        skew_close_s = pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
+    else:
+        skew_close_s = clean_series(skew['Close'])
 
-    # 2. FRED 데이터 수집
-    df_hy, date_hy = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
-    df_assets, date_walcl = fetch_fred_api("WALCL", fred_api_key)
-    df_tga, date_tga = fetch_fred_api("WTREGEN", fred_api_key)
-    df_rrp, date_rrp = fetch_fred_api("RRPONTSYD", fred_api_key)
+    # 2. FRED 데이터 수집 및 고정/지연 검증
+    df_hy, date_hy, hy_stale = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
+    df_assets, date_walcl, walcl_stale = fetch_fred_api("WALCL", fred_api_key)
+    df_tga, date_tga, tga_stale = fetch_fred_api("WTREGEN", fred_api_key)
+    df_rrp, date_rrp, rrp_stale = fetch_fred_api("RRPONTSYD", fred_api_key)
+
+    if df_hy is None or hy_stale:
+        data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류 또는 7일 이상 지연")
+    if df_assets is None or df_tga is None or df_rrp is None or walcl_stale:
+        data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 3. 주말/야간 선물 갭 감지
     fut_gap_status = ""
@@ -128,6 +156,8 @@ def calculate_ultra_risk_score():
                 fut_gap_status = f"🚨 <b>[야간/주말 NQ선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
             elif fut_change >= 1.5:
                 fut_gap_status = f"🚀 <b>[야간/주말 NQ선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
+    else:
+        data_warnings.append("⚠️ NQ 선물(야간 갭) 데이터 수신 미확인")
 
     # 4. 이동평균선 & 횡보장 감지용 볼린저 밴드
     sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
@@ -150,7 +180,7 @@ def calculate_ultra_risk_score():
     disp_200 = float(disp200_s.iloc[-1])
     bb_width = float(bb_width_s.iloc[-1])
 
-    is_ranging_market = (bb_width <= 4.0)  # 볼린저밴드 수축 횡보장 판별
+    is_ranging_market = (bb_width <= 4.0)
     peak_52w = float(qqq_close.tail(252).max())
     drawdown = ((current_close / peak_52w) - 1) * 100
 
@@ -221,11 +251,15 @@ def calculate_ultra_risk_score():
                 score_breadth = 15.0
             elif qqq_20d_ret > 0 and breadth_divergence >= 2.0:
                 score_breadth = 7.5
+        else:
+            data_warnings.append("⚠️ QQQE(동일가중) 데이터 수신 누락")
     except Exception:
-        pass
+        data_warnings.append("⚠️ QQQE(동일가중) 연산 오류")
 
     # 지표 5: PCR
     pcr_val, pcr_is_fallback = fetch_equity_pcr()
+    if pcr_is_fallback:
+        data_warnings.append("⚠️ Equity PCR 크롤링 실패 (0.58 기본값 고정)")
     score_pcr = float(np.clip((0.85 - pcr_val) * (10 / 0.35), 0, 10))
     pcr_tag = " ⚠️[Fallback적용]" if pcr_is_fallback else ""
 
@@ -279,7 +313,6 @@ def calculate_ultra_risk_score():
     except Exception:
         liq_date_str = " ⚠️[API대체]"
 
-    # 점수 총합 연산
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
     total_score = round(sum(clean_scores), 1)
@@ -295,12 +328,9 @@ def calculate_ultra_risk_score():
     below_sma5 = (current_close < sma5)
     below_sma20 = (current_close < sma20)
 
-    # 거시 역풍(Macro Headwind) 판별: 유동성 감소세 or 하이일드 4.0% 이상
     is_macro_headwind = (liq_change_4w < -1.0) or (hy_current >= 4.0)
 
-    # ====================================================
-    # [전략 1] QQQ 1배수 정석 전략 지침 매핑
-    # ====================================================
+    # QQQ 1배수 지침 매핑
     if total_score >= 80:
         if below_sma5 or macd_deadcross:
             qqq_action = "🚨 <b>[확률 95% 대세 고점 격발]</b> 👉 추가 50% 매도 (총 현금 비중 80~100% 확보)"
@@ -323,9 +353,7 @@ def calculate_ultra_risk_score():
     else:
         qqq_action = "🟢 <b>[안정 국면]</b> 👉 주식 비중 100% 유지"
 
-    # ====================================================
-    # [전략 2] TQQQ 3배수 기관급 레버리지 전략 지침 매핑
-    # ====================================================
+    # TQQQ 3배수 기관급 지침 매핑
     if fut_gap_severe:
         tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> NQ선물 -1.5% 이상 급락! 👉 <b>프리마켓/시초가 TQQQ 30% 선제 축소</b> (슬리피지 방어)"
     elif total_score >= 80:
@@ -350,9 +378,7 @@ def calculate_ultra_risk_score():
     else:
         tqqq_action = "🟢 <b>[TQQQ 안정 국면]</b> 👉 TQQQ 100% 포지션 유지"
 
-    # ====================================================
-    # [바닥 탐색 모드 (-10% 하락 시 듀얼 매핑)]
-    # ====================================================
+    # 바닥 탐색 모드 (-10% 하락 시)
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
@@ -365,7 +391,6 @@ def calculate_ultra_risk_score():
         if not below_sma5: b_score += 25.0
         if not macd_deadcross: b_score += 25.0
 
-        # QQQ 1배수 바닥 매수 지침
         if b_score >= 75:
             qqq_b_action = "💎 <b>[찐바닥 확정]</b> 잔여 현금 40% 전량 투입 (주식 100% 완전 복귀)"
         elif b_score >= 50:
@@ -375,7 +400,6 @@ def calculate_ultra_risk_score():
         else:
             qqq_b_action = "⏳ <b>[패닉 진행 중]</b> 현금 100% 보존하며 바닥 신호 대기"
 
-        # TQQQ 3배수 기관급 바닥 매수 지침 (거시 역풍 시 50% 캡 & 분할 비율 차별화)
         if is_macro_headwind:
             headwind_tag = "⚠️ <b>[거시 역풍 구간 — TQQQ 투입 총량 50% 캡 제한]</b>\n"
             if b_score >= 75:
@@ -405,9 +429,15 @@ def calculate_ultra_risk_score():
             f"📙 <b>[TQQQ 3배수 기관급 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
 
+    # 데이터 품질/이상 경보 배너 생성
+    warning_banner = ""
+    if data_warnings:
+        warning_banner = "🚨 <b>[데이터 품질/수집 경보]</b>\n" + "\n".join([f"• {w}" for w in data_warnings]) + "\n────────────────\n"
+
     report = (
         f"📊 <b>[QQQ & TQQQ 듀얼 전략 정밀 판독기]</b>\n"
         f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"{warning_banner}"
         f"{fut_gap_status}"
         f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
         f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
