@@ -6,6 +6,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+def clean_series(df_col):
+    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환"""
+    if isinstance(df_col, pd.DataFrame):
+        return df_col.iloc[:, 0].astype(float)
+    return df_col.astype(float)
+
 def fetch_fred_api(series_id, api_key):
     """FRED 공식 REST API 및 최종 데이터 일자 확인"""
     if not api_key:
@@ -35,7 +41,8 @@ def fetch_fred_api(series_id, api_key):
         df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
         last_date = df["DATE"].iloc[-1]
         return df, last_date
-    except Exception:
+    except Exception as e:
+        print(f"FRED 에러 ({series_id}): {e}")
         return None, None
 
 def fetch_equity_pcr():
@@ -76,16 +83,20 @@ def fetch_equity_pcr():
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
 
-    # 1. 시세 및 선물(NQ=F) 다운로드
-    qqq = yf.download("QQQ", period="3y", interval="1d", progress=False)
-    nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False)
-    vix = yf.download("^VIX", period="3mo", interval="1d", progress=False)
-    vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False)
-    vix3m = yf.download("^VIX3M", period="3mo", interval="1d", progress=False)
-    skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False)
+    # 1. 시세 및 선물 다운로드 (auto_adjust=False로 명시적 분리)
+    qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
+    nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
+    vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
+    vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False, auto_adjust=False)
+    vix3m = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
+    skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
 
-    if vxn.empty or len(vxn) < 20:
-        vxn = vix
+    # Close 컬럼 1차원 평탄화
+    qqq_close = clean_series(qqq['Close'])
+    vix_close_s = clean_series(vix['Close'])
+    vxn_close_s = clean_series(vxn['Close']) if not vxn.empty and len(vxn) >= 20 else vix_close_s
+    vix3m_close_s = clean_series(vix3m['Close']) if not vix3m.empty else (vix_close_s * 1.1)
+    skew_close_s = clean_series(skew['Close']) if not skew.empty else pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
 
     # 2. FRED 데이터 수집
     df_hy, date_hy = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
@@ -93,11 +104,12 @@ def calculate_ultra_risk_score():
     df_tga, date_tga = fetch_fred_api("WTREGEN", fred_api_key)
     df_rrp, date_rrp = fetch_fred_api("RRPONTSYD", fred_api_key)
 
-    # 3. 주말 야간 선물 갭 감지
+    # 3. 선물 갭 감지
     fut_gap_status = ""
     if not nq_fut.empty and len(nq_fut) >= 2:
-        fut_curr = float(nq_fut['Close'].iloc[-1])
-        fut_prev = float(nq_fut['Close'].iloc[-2])
+        nq_close = clean_series(nq_fut['Close'])
+        fut_curr = float(nq_close.iloc[-1])
+        fut_prev = float(nq_close.iloc[-2])
         fut_change = ((fut_curr / fut_prev) - 1) * 100
         if fut_change <= -1.5:
             fut_gap_status = f"🚨 <b>[주말/야간 선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b> (돌발 악재 반영 중)\n"
@@ -105,37 +117,37 @@ def calculate_ultra_risk_score():
             fut_gap_status = f"🚀 <b>[주말/야간 선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
 
     # 4. 이동평균선 & 횡보장 감지용 볼린저 밴드
-    qqq['SMA5'] = qqq['Close'].rolling(window=5).mean()
-    qqq['SMA20'] = qqq['Close'].rolling(window=20).mean()
-    qqq['SMA50'] = qqq['Close'].rolling(window=50).mean()
-    qqq['SMA200'] = qqq['Close'].rolling(window=200).mean()
-    qqq['Disp200'] = (qqq['Close'] / qqq['SMA200']) * 100
+    sma5_s = qqq_close.rolling(window=5).mean()
+    sma20_s = qqq_close.rolling(window=20).mean()
+    sma50_s = qqq_close.rolling(window=50).mean()
+    sma200_s = qqq_close.rolling(window=200).mean()
+    disp200_s = (qqq_close / sma200_s) * 100
 
-    rolling_std20 = qqq['Close'].rolling(window=20).std()
-    qqq['BB_Upper'] = qqq['SMA20'] + (rolling_std20 * 2)
-    qqq['BB_Lower'] = qqq['SMA20'] - (rolling_std20 * 2)
-    qqq['BB_Width'] = ((qqq['BB_Upper'] - qqq['BB_Lower']) / qqq['SMA20']) * 100
+    rolling_std20 = qqq_close.rolling(window=20).std()
+    bb_upper = sma20_s + (rolling_std20 * 2)
+    bb_lower = sma20_s - (rolling_std20 * 2)
+    bb_width_s = ((bb_upper - bb_lower) / sma20_s) * 100
 
-    current_close = float(qqq['Close'].iloc[-1])
-    sma5 = float(qqq['SMA5'].iloc[-1])
-    sma20 = float(qqq['SMA20'].iloc[-1])
-    sma50 = float(qqq['SMA50'].iloc[-1])
-    sma200 = float(qqq['SMA200'].iloc[-1])
-    disp_200 = float(qqq['Disp200'].iloc[-1])
-    bb_width = float(qqq['BB_Width'].iloc[-1])
+    current_close = float(qqq_close.iloc[-1])
+    sma5 = float(sma5_s.iloc[-1])
+    sma20 = float(sma20_s.iloc[-1])
+    sma50 = float(sma50_s.iloc[-1])
+    sma200 = float(sma200_s.iloc[-1])
+    disp_200 = float(disp200_s.iloc[-1])
+    bb_width = float(bb_width_s.iloc[-1])
 
     is_ranging_market = (bb_width <= 4.0)
-    peak_52w = float(qqq['Close'].tail(252).max())
+    peak_52w = float(qqq_close.tail(252).max())
     drawdown = ((current_close / peak_52w) - 1) * 100
 
     # 지표 1: 200일 이격 Z-Score
-    disp_mean = qqq['Disp200'].mean()
-    disp_std = qqq['Disp200'].std()
+    disp_mean = float(disp200_s.mean())
+    disp_std = float(disp200_s.std())
     z_disp = float((disp_200 - disp_mean) / disp_std) if disp_std > 0 else 0.0
     score_disp = float(np.clip(z_disp * (10 / 2.0), 0, 10))
 
     # 지표 2: 주봉 RSI
-    qqq_w = qqq['Close'].resample('W-FRI').last()
+    qqq_w = qqq_close.resample('W-FRI').last()
     delta_w = qqq_w.diff()
     gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean()
     loss_w = (-delta_w.where(delta_w < 0, 0)).rolling(window=14).mean()
@@ -143,10 +155,10 @@ def calculate_ultra_risk_score():
     score_rsi = float(np.clip((weekly_rsi - 50) * (10 / 30), 0, 10))
 
     # 지표 3-1: VXN
-    vxn_current = float(vxn['Close'].iloc[-1])
-    vxn_20d_ago = float(vxn['Close'].iloc[-20])
+    vxn_current = float(vxn_close_s.iloc[-1])
+    vxn_20d_ago = float(vxn_close_s.iloc[-20])
     vxn_change_20d = vxn_current - vxn_20d_ago
-    qqq_20d_ret = ((current_close / float(qqq['Close'].iloc[-20])) - 1) * 100
+    qqq_20d_ret = ((current_close / float(qqq_close.iloc[-20])) - 1) * 100
 
     score_vxn = 0.0
     vxn_status = "정상"
@@ -163,28 +175,30 @@ def calculate_ultra_risk_score():
         vxn_status = "🟢 변동성 안정"
 
     # 지표 3-2: SKEW
-    skew_current = float(skew['Close'].iloc[-1]) if not skew.empty else 125.0
+    skew_current = float(skew_close_s.iloc[-1])
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
     skew_status = "🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상"
 
     # 지표 3-3: 기간구조
-    vix_close = float(vix['Close'].iloc[-1])
-    vix3m_close = float(vix3m['Close'].iloc[-1]) if not vix3m.empty else (vix_close * 1.1)
-    vix_ratio = round(vix_close / vix3m_close, 2)
+    vix_val = float(vix_close_s.iloc[-1])
+    vix3m_val = float(vix3m_close_s.iloc[-1])
+    vix_ratio = round(vix_val / vix3m_val, 2)
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 4: 쏠림도
+    # 지표 4: QQQ vs QQQE 쏠림
     score_breadth = 0.0
     breadth_divergence = 0.0
     try:
-        qqqe = yf.download("QQQE", period="2mo", interval="1d", progress=False)
-        qqqe_ret_20d = ((float(qqqe['Close'].iloc[-1]) / float(qqqe['Close'].iloc[-20])) - 1) * 100
-        breadth_divergence = qqq_20d_ret - qqqe_ret_20d
-        if qqq_20d_ret > 0 and breadth_divergence >= 4.0:
-            score_breadth = 15.0
-        elif qqq_20d_ret > 0 and breadth_divergence >= 2.0:
-            score_breadth = 7.5
+        qqqe = yf.download("QQQE", period="2mo", interval="1d", progress=False, auto_adjust=False)
+        if not qqqe.empty:
+            qqqe_close = clean_series(qqqe['Close'])
+            qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / float(qqqe_close.iloc[-20])) - 1) * 100
+            breadth_divergence = qqq_20d_ret - qqqe_ret_20d
+            if qqq_20d_ret > 0 and breadth_divergence >= 4.0:
+                score_breadth = 15.0
+            elif qqq_20d_ret > 0 and breadth_divergence >= 2.0:
+                score_breadth = 7.5
     except Exception:
         pass
 
@@ -254,9 +268,9 @@ def calculate_ultra_risk_score():
         score_breadth + score_pcr + score_hy + score_liq, 1
     )
 
-    # MACD 및 추세 연산
-    ema12 = qqq['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = qqq['Close'].ewm(span=26, adjust=False).mean()
+    # MACD 연산
+    ema12 = qqq_close.ewm(span=12, adjust=False).mean()
+    ema26 = qqq_close.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
     macd_curr = float(macd_line.iloc[-1])
@@ -265,9 +279,7 @@ def calculate_ultra_risk_score():
     below_sma5 = (current_close < sma5)
     below_sma20 = (current_close < sma20)
 
-    # ====================================================
-    # [정량화된 고점 관리 지침 매핑]
-    # ====================================================
+    # 고점 관리 지침
     if total_score >= 80:
         if below_sma5 or macd_deadcross:
             action_signal = "🚨 <b>[확률 95% 대세 고점 격발]</b>\n👉 <b>추가 50% 매도 실행 (총 현금 비중 80~100% 확보 및 풋/인버스 헤지)</b>"
@@ -290,13 +302,11 @@ def calculate_ultra_risk_score():
     else:
         action_signal = "🟢 <b>[안정 국면]</b>\n👉 주식 비중 100% 유지"
 
-    # ====================================================
-    # [정량화된 바닥 탐색 모드 지침 매핑 (-10% 하락 시)]
-    # ====================================================
+    # 바닥 탐색 모드 (-10% 하락 시)
     bottom_section = ""
     if drawdown <= -10.0:
-        vix_sma5 = vix['Close'].rolling(5).mean()
-        vix_peaked = float(vix['Close'].iloc[-1]) < float(vix_sma5.iloc[-1]) and float(vix['Close'].max()) >= 25.0
+        vix_sma5 = vix_close_s.rolling(5).mean()
+        vix_peaked = float(vix_close_s.iloc[-1]) < float(vix_sma5.iloc[-1]) and float(vix_close_s.max()) >= 25.0
         term_normalized = (vix_ratio < 0.95)
 
         b_score = 0.0
@@ -348,6 +358,7 @@ def send_telegram_message(text):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        print("경고: TELEGRAM_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 설정되지 않았습니다.")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -357,7 +368,14 @@ def send_telegram_message(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    requests.post(url, data=payload)
+    try:
+        res = requests.post(url, data=payload, timeout=10)
+        if res.status_code == 200:
+            print("텔레그램 전송 성공!")
+        else:
+            print(f"텔레그램 전송 실패: {res.status_code}, {res.text}")
+    except Exception as e:
+        print(f"텔레그램 통신 오류: {e}")
 
 if __name__ == "__main__":
     msg = calculate_ultra_risk_score()
