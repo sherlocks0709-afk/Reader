@@ -1,31 +1,34 @@
-name: NASDAQ Daily Risk Alert
+name: Nasdaq QQQ Daily Ultra Monitor
 
 on:
   schedule:
-    # UTC 기준 00:00 = 한국 시간(KST) 매일 오전 9:00
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    # UTC 기준 22:13 (일~금) = 한국 시간(KST) 매일 오전 07:13 (월~토) 발송
+    # :13분처럼 홀수 분을 지정하면 GitHub Actions 큐 지연 없이 1~2분 내 즉시 실행됩니다.
+    - cron: '13 22 * * 0-5'
+  workflow_dispatch: # 언제든 GitHub 웹에서 'Run workflow'로 수동 즉시 실행 가능
 
 jobs:
-  run-risk-analyzer:
+  run-monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: 저장소 코드 불러오기
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Python 환경 설정
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: 필수 라이브러리 설치
+      - name: Install Dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install yfinance pandas numpy requests
 
-      - name: 고점 판독기 실행 및 텔레그램 발송
+      - name: Execute Daily Monitor Script
         env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python nasdaq_monitor.py
