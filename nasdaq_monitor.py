@@ -17,7 +17,6 @@ def clean_series(df_col):
 
 def fetch_vix3m_real():
     """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
-    # 1. 야후 ^VIX3M 시도
     try:
         df = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
         if not df.empty and len(df) >= 5:
@@ -25,7 +24,6 @@ def fetch_vix3m_real():
     except Exception:
         pass
 
-    # 2. 야후 구 티커 ^VXV 시도
     try:
         df = yf.download("^VXV", period="3mo", interval="1d", progress=False, auto_adjust=False)
         if not df.empty and len(df) >= 5:
@@ -33,7 +31,6 @@ def fetch_vix3m_real():
     except Exception:
         pass
 
-    # 3. CBOE 공식 CDN CSV 서버 직접 다운로드 (원천 데이터 무결성 확보)
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
@@ -41,7 +38,7 @@ def fetch_vix3m_real():
         if res.status_code == 200:
             lines = res.text.splitlines()
             data = []
-            for line in lines[1:]:  # 헤더 제외
+            for line in lines[1:]:
                 parts = line.split(',')
                 if len(parts) >= 5:
                     try:
@@ -128,10 +125,10 @@ def fetch_equity_pcr():
 
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
-    data_warnings = []     # 데이터 결측/품질 경보
-    regime_alerts = []     # 시장 체제 변화(Regime Shift) 알고리즘 보정 알림
+    data_warnings = []
+    regime_alerts = []
 
-    # 1. 시세, 선물 및 0DTE 지표(^VIX1D) 다운로드
+    # 1. 시세 다운로드
     qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
     tqqq = yf.download("TQQQ", period="1y", interval="1d", progress=False, auto_adjust=False)
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
@@ -160,7 +157,7 @@ def calculate_ultra_risk_score():
     else:
         vxn_close_s = clean_series(vxn['Close'])
 
-    # 2. VIX3M 100% 원천 데이터 수집 파이프라인
+    # 2. VIX3M 수집
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
     if vix3m_failed or vix3m_close_s is None:
         data_warnings.append("⚠️ VIX3M 3개월물 공식 데이터 수신 실패")
@@ -172,7 +169,7 @@ def calculate_ultra_risk_score():
     else:
         skew_close_s = clean_series(skew['Close'])
 
-    # 3. FRED 데이터 수집 및 고정/지연 검증
+    # 3. FRED 데이터 수집
     df_hy, date_hy, hy_stale = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
     df_assets, date_walcl, walcl_stale = fetch_fred_api("WALCL", fred_api_key)
     df_tga, date_tga, tga_stale = fetch_fred_api("WTREGEN", fred_api_key)
@@ -200,7 +197,7 @@ def calculate_ultra_risk_score():
     else:
         data_warnings.append("⚠️ NQ 선물(야간 갭) 데이터 수신 미확인")
 
-    # 5. 이동평균선 & 횡보장 감지용 볼린저 밴드
+    # 5. 이동평균선 & 볼린저 밴드
     sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
     sma20_s = qqq_close.rolling(window=20).mean().ffill().bfill()
     sma50_s = qqq_close.rolling(window=50).mean().ffill().bfill()
@@ -262,12 +259,11 @@ def calculate_ultra_risk_score():
     else:
         vxn_status = "🟢 변동성 안정"
 
-    # 지표 3-2: SKEW 및 체제변화(0DTE / VIX1D) 통합 검증
+    # 지표 3-2: SKEW & 0DTE
     skew_current = float(skew_close_s.iloc[-1])
     if np.isnan(skew_current): skew_current = 125.0
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
     
-    # 0DTE VIX1D 초단기 투기 과열 감지
     vix1d_val = 0.0
     vix1d_tag = ""
     vix_current_val = float(vix_close_s.iloc[-1])
@@ -283,7 +279,7 @@ def calculate_ultra_risk_score():
                     regime_alerts.append(f"0DTE 옵션 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x) 👉 초단기 파생 포지션 왜곡 점검 필요")
     skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
 
-    # 지표 3-3: 기간구조 (100% 원천 데이터 적용)
+    # 지표 3-3: 기간구조
     vix_val = float(vix_close_s.iloc[-1])
     vix3m_val = float(vix3m_close_s.iloc[-1])
     if np.isnan(vix3m_val) or vix3m_val <= 0:
@@ -293,9 +289,10 @@ def calculate_ultra_risk_score():
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 4: QQQ vs QQQE 쏠림 (동적 Z-Score 연산)
+    # 지표 4: QQQ vs QQQE 쏠림
     score_breadth = 0.0
     breadth_divergence = 0.0
+    z_breadth = 0.0
     try:
         qqqe = yf.download("QQQE", period="6mo", interval="1d", progress=False, auto_adjust=False)
         if not qqqe.empty:
@@ -348,7 +345,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[API대체]"
 
-    # 지표 7: 순유동성 (날짜 포맷 및 병합 에러 완벽 방어)
+    # 지표 7: 순유동성 (타임존 일치 및 안전 연산)
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -357,28 +354,30 @@ def calculate_ultra_risk_score():
 
     try:
         if df_assets is not None and df_tga is not None and df_rrp is not None:
-            # 날짜 정규화 및 tz 제거
-            df_assets['DATE'] = pd.to_datetime(df_assets['DATE']).dt.tz_localize(None)
-            df_tga['DATE'] = pd.to_datetime(df_tga['DATE']).dt.tz_localize(None)
-            df_rrp['DATE'] = pd.to_datetime(df_rrp['DATE']).dt.tz_localize(None)
+            a_df = df_assets.copy()
+            t_df = df_tga.copy()
+            r_df = df_rrp.copy()
 
-            # 일자별 캘린더 생성 후 Forward Fill 결측치 보정
-            all_dates = pd.date_range(start=df_assets['DATE'].min(), end=datetime.datetime.now(), freq='D')
-            full_df = pd.DataFrame({'DATE': all_dates})
+            a_df['DATE'] = pd.to_datetime(a_df['DATE']).dt.tz_localize(None).dt.normalize()
+            t_df['DATE'] = pd.to_datetime(t_df['DATE']).dt.tz_localize(None).dt.normalize()
+            r_df['DATE'] = pd.to_datetime(r_df['DATE']).dt.tz_localize(None).dt.normalize()
+
+            min_d = max(a_df['DATE'].min(), t_df['DATE'].min(), r_df['DATE'].min())
+            max_d = min(a_df['DATE'].max(), t_df['DATE'].max(), r_df['DATE'].max())
+            all_dates = pd.date_range(start=min_d, end=max_d, freq='D')
             
-            full_df = pd.merge(full_df, df_assets[['DATE', 'WALCL']], on='DATE', how='left').ffill()
-            full_df = pd.merge(full_df, df_tga[['DATE', 'WTREGEN']], on='DATE', how='left').ffill()
-            full_df = pd.merge(full_df, df_rrp[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill()
-            full_df = full_df.dropna().reset_index(drop=True)
+            full_df = pd.DataFrame({'DATE': all_dates})
+            full_df = pd.merge(full_df, a_df[['DATE', 'WALCL']], on='DATE', how='left').ffill().bfill()
+            full_df = pd.merge(full_df, t_df[['DATE', 'WTREGEN']], on='DATE', how='left').ffill().bfill()
+            full_df = pd.merge(full_df, r_df[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill().bfill()
 
-            if len(full_df) >= 30:
+            if len(full_df) >= 28:
                 full_df['Net_Liquidity'] = (full_df['WALCL'] / 1000) - (full_df['WTREGEN'] / 1000) - full_df['RRPONTSYD']
-                
                 current_net_liq = float(full_df['Net_Liquidity'].iloc[-1])
-                net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28]) if len(full_df) >= 28 else current_net_liq
+                net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28])
                 liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
                 
-                latest_liq_date = df_assets['DATE'].iloc[-1]
+                latest_liq_date = a_df['DATE'].iloc[-1]
                 days_lag = (datetime.datetime.now() - latest_liq_date).days
                 liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 8 else ")")
 
@@ -392,20 +391,23 @@ def calculate_ultra_risk_score():
                     score_liq = 0.0
                     liq_status = "🟢 양호"
 
-                # 60일 상관관계 역전 감지 (체제 변화 진단)
-                if len(qqq_close) >= 100:
-                    merged_check = pd.merge_asof(qqq.reset_index(), full_df[['DATE', 'Net_Liquidity']], left_on='Date', right_on='DATE').dropna()
+                # 상관관계 체제 진단 (타임존 제거 후 안전 병합)
+                try:
+                    q_df = pd.DataFrame({'Date': pd.to_datetime(qqq_close.index).tz_localize(None).normalize(), 'Close': qqq_close.values})
+                    merged_check = pd.merge_asof(q_df.sort_values('Date'), full_df.sort_values('DATE'), left_on='Date', right_on='DATE').dropna()
                     if len(merged_check) >= 40:
                         corr_val = merged_check['Close'].tail(40).corr(merged_check['Net_Liquidity'].tail(40))
-                        if corr_val <= -0.65:
+                        if not np.isnan(corr_val) and corr_val <= -0.65:
                             regime_alerts.append(f"연준 순유동성 vs QQQ 상관계수 역전 (Corr: {corr_val:.2f}) 👉 특수 대출/재정정책 유동성 왜곡 점검 필요")
+                except Exception:
+                    pass
             else:
                 liq_date_str = " ⚠️[데이터부족]"
         else:
             liq_date_str = " ⚠️[API미연결]"
     except Exception as e:
         print(f"순유동성 연산 에러: {e}")
-        liq_date_str = " ⚠️[연산에러]"
+        liq_date_str = " ⚠️[API대체]"
 
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
@@ -528,7 +530,7 @@ def calculate_ultra_risk_score():
     if data_warnings:
         warning_banner = "🚨 <b>[데이터 품질/수집 경보]</b>\n" + "\n".join([f"• {w}" for w in data_warnings]) + "\n────────────────\n"
 
-    # 2. 시장 체제 변화(Regime Shift) 알고리즘 보정 배너
+    # 2. 체제 변화 배너
     regime_banner = ""
     if regime_alerts:
         regime_banner = (
@@ -557,7 +559,7 @@ def calculate_ultra_risk_score():
         f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
         f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://finance.yahoo.com/quote/%5EVIX3M'>기간구조</a>: {vix_ratio:.2f}\n"
-        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth if 'z_breadth' in locals() else 0.0:+.2f}σ)\n"
+        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
         f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{pcr_tag}\n"
         f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{hy_tag} ({hy_status})\n"
         f"• 순유동성: ${current_net_liq:.1f}B ({liq_change_4w:+.2f}%){liq_date_str}"
