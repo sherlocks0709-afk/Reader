@@ -348,7 +348,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[API대체]"
 
-    # 지표 7: 순유동성
+    # 지표 7: 순유동성 (날짜 포맷 및 병합 에러 완벽 방어)
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -357,38 +357,55 @@ def calculate_ultra_risk_score():
 
     try:
         if df_assets is not None and df_tga is not None and df_rrp is not None:
-            m1 = pd.merge(df_assets, df_tga, on='DATE', how='inner')
-            df_rrp_w = df_rrp.set_index('DATE').resample('W-WED').mean().reset_index()
-            liq_df = pd.merge(m1, df_rrp_w, on='DATE', how='inner')
-            liq_df['Net_Liquidity'] = (liq_df['WALCL'] / 1000) - (liq_df['WTREGEN'] / 1000) - liq_df['RRPONTSYD']
-            
-            current_net_liq = float(liq_df['Net_Liquidity'].iloc[-1])
-            net_liq_4w_ago = float(liq_df['Net_Liquidity'].iloc[-5]) if len(liq_df) >= 5 else current_net_liq
-            liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
-            
-            latest_liq_date = liq_df['DATE'].iloc[-1]
-            days_lag = (datetime.datetime.now() - latest_liq_date).days
-            liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 6 else ")")
+            # 날짜 정규화 및 tz 제거
+            df_assets['DATE'] = pd.to_datetime(df_assets['DATE']).dt.tz_localize(None)
+            df_tga['DATE'] = pd.to_datetime(df_tga['DATE']).dt.tz_localize(None)
+            df_rrp['DATE'] = pd.to_datetime(df_rrp['DATE']).dt.tz_localize(None)
 
-            if qqq_20d_ret > 0 and liq_change_4w < -2.0:
-                score_liq = 15.0
-                liq_status = "🚨 유동성 흡수"
-            elif qqq_20d_ret > 0 and liq_change_4w < 0:
-                score_liq = 7.5
-                liq_status = "⚠️ 정체"
+            # 일자별 캘린더 생성 후 Forward Fill 결측치 보정
+            all_dates = pd.date_range(start=df_assets['DATE'].min(), end=datetime.datetime.now(), freq='D')
+            full_df = pd.DataFrame({'DATE': all_dates})
+            
+            full_df = pd.merge(full_df, df_assets[['DATE', 'WALCL']], on='DATE', how='left').ffill()
+            full_df = pd.merge(full_df, df_tga[['DATE', 'WTREGEN']], on='DATE', how='left').ffill()
+            full_df = pd.merge(full_df, df_rrp[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill()
+            full_df = full_df.dropna().reset_index(drop=True)
+
+            if len(full_df) >= 30:
+                full_df['Net_Liquidity'] = (full_df['WALCL'] / 1000) - (full_df['WTREGEN'] / 1000) - full_df['RRPONTSYD']
+                
+                current_net_liq = float(full_df['Net_Liquidity'].iloc[-1])
+                net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28]) if len(full_df) >= 28 else current_net_liq
+                liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
+                
+                latest_liq_date = df_assets['DATE'].iloc[-1]
+                days_lag = (datetime.datetime.now() - latest_liq_date).days
+                liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 8 else ")")
+
+                if qqq_20d_ret > 0 and liq_change_4w < -2.0:
+                    score_liq = 15.0
+                    liq_status = "🚨 유동성 흡수"
+                elif qqq_20d_ret > 0 and liq_change_4w < 0:
+                    score_liq = 7.5
+                    liq_status = "⚠️ 정체"
+                else:
+                    score_liq = 0.0
+                    liq_status = "🟢 양호"
+
+                # 60일 상관관계 역전 감지 (체제 변화 진단)
+                if len(qqq_close) >= 100:
+                    merged_check = pd.merge_asof(qqq.reset_index(), full_df[['DATE', 'Net_Liquidity']], left_on='Date', right_on='DATE').dropna()
+                    if len(merged_check) >= 40:
+                        corr_val = merged_check['Close'].tail(40).corr(merged_check['Net_Liquidity'].tail(40))
+                        if corr_val <= -0.65:
+                            regime_alerts.append(f"연준 순유동성 vs QQQ 상관계수 역전 (Corr: {corr_val:.2f}) 👉 특수 대출/재정정책 유동성 왜곡 점검 필요")
             else:
-                score_liq = 0.0
-                liq_status = "🟢 양호"
-
-            # 60일 상관관계 역전 감지 (체제 변화 진단)
-            if len(liq_df) >= 20 and len(qqq_close) >= 100:
-                merged_check = pd.merge_asof(qqq.reset_index(), liq_df[['DATE', 'Net_Liquidity']], left_on='Date', right_on='DATE').dropna()
-                if len(merged_check) >= 40:
-                    corr_val = merged_check['Close'].tail(40).corr(merged_check['Net_Liquidity'].tail(40))
-                    if corr_val <= -0.65:
-                        regime_alerts.append(f"연준 순유동성 vs QQQ 상관계수 역전 (Corr: {corr_val:.2f}) 👉 특수 대출/재정정책 유동성 왜곡 점검 필요")
-    except Exception:
-        liq_date_str = " ⚠️[API대체]"
+                liq_date_str = " ⚠️[데이터부족]"
+        else:
+            liq_date_str = " ⚠️[API미연결]"
+    except Exception as e:
+        print(f"순유동성 연산 에러: {e}")
+        liq_date_str = " ⚠️[연산에러]"
 
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
