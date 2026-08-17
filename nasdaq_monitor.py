@@ -7,10 +7,13 @@ import pandas as pd
 import numpy as np
 
 def clean_series(df_col):
-    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환"""
+    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 보정"""
     if isinstance(df_col, pd.DataFrame):
-        return df_col.iloc[:, 0].astype(float)
-    return df_col.astype(float)
+        s = df_col.iloc[:, 0]
+    else:
+        s = df_col
+    s = pd.to_numeric(s, errors='coerce').ffill().bfill()
+    return s.astype(float)
 
 def fetch_fred_api(series_id, api_key):
     """FRED 공식 REST API 및 최종 데이터 일자 확인"""
@@ -83,7 +86,7 @@ def fetch_equity_pcr():
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
 
-    # 1. 시세 및 선물 다운로드 (auto_adjust=False로 명시적 분리)
+    # 1. 시세 및 선물 다운로드
     qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
     vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
@@ -91,11 +94,16 @@ def calculate_ultra_risk_score():
     vix3m = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
     skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
 
-    # Close 컬럼 1차원 평탄화
     qqq_close = clean_series(qqq['Close'])
-    vix_close_s = clean_series(vix['Close'])
-    vxn_close_s = clean_series(vxn['Close']) if not vxn.empty and len(vxn) >= 20 else vix_close_s
-    vix3m_close_s = clean_series(vix3m['Close']) if not vix3m.empty else (vix_close_s * 1.1)
+    vix_close_s = clean_series(vix['Close']) if not vix.empty else pd.Series([18.0]*len(qqq_close), index=qqq_close.index)
+    vxn_close_s = clean_series(vxn['Close']) if (not vxn.empty and len(vxn) >= 20) else vix_close_s
+
+    # VIX3M 결측치 완벽 방어
+    if not vix3m.empty and len(vix3m) >= 5:
+        vix3m_close_s = clean_series(vix3m['Close'])
+    else:
+        vix3m_close_s = vix_close_s * 1.1
+
     skew_close_s = clean_series(skew['Close']) if not skew.empty else pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
 
     # 2. FRED 데이터 수집
@@ -110,20 +118,21 @@ def calculate_ultra_risk_score():
         nq_close = clean_series(nq_fut['Close'])
         fut_curr = float(nq_close.iloc[-1])
         fut_prev = float(nq_close.iloc[-2])
-        fut_change = ((fut_curr / fut_prev) - 1) * 100
-        if fut_change <= -1.5:
-            fut_gap_status = f"🚨 <b>[주말/야간 선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b> (돌발 악재 반영 중)\n"
-        elif fut_change >= 1.5:
-            fut_gap_status = f"🚀 <b>[주말/야간 선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
+        if fut_prev > 0:
+            fut_change = ((fut_curr / fut_prev) - 1) * 100
+            if fut_change <= -1.5:
+                fut_gap_status = f"🚨 <b>[주말/야간 선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b> (돌발 악재 반영 중)\n"
+            elif fut_change >= 1.5:
+                fut_gap_status = f"🚀 <b>[주말/야간 선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
 
     # 4. 이동평균선 & 횡보장 감지용 볼린저 밴드
-    sma5_s = qqq_close.rolling(window=5).mean()
-    sma20_s = qqq_close.rolling(window=20).mean()
-    sma50_s = qqq_close.rolling(window=50).mean()
-    sma200_s = qqq_close.rolling(window=200).mean()
+    sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
+    sma20_s = qqq_close.rolling(window=20).mean().ffill().bfill()
+    sma50_s = qqq_close.rolling(window=50).mean().ffill().bfill()
+    sma200_s = qqq_close.rolling(window=200).mean().ffill().bfill()
     disp200_s = (qqq_close / sma200_s) * 100
 
-    rolling_std20 = qqq_close.rolling(window=20).std()
+    rolling_std20 = qqq_close.rolling(window=20).std().ffill().bfill()
     bb_upper = sma20_s + (rolling_std20 * 2)
     bb_lower = sma20_s - (rolling_std20 * 2)
     bb_width_s = ((bb_upper - bb_lower) / sma20_s) * 100
@@ -147,18 +156,21 @@ def calculate_ultra_risk_score():
     score_disp = float(np.clip(z_disp * (10 / 2.0), 0, 10))
 
     # 지표 2: 주봉 RSI
-    qqq_w = qqq_close.resample('W-FRI').last()
+    qqq_w = qqq_close.resample('W-FRI').last().ffill().bfill()
     delta_w = qqq_w.diff()
-    gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean()
-    loss_w = (-delta_w.where(delta_w < 0, 0)).rolling(window=14).mean()
-    weekly_rsi = float((100 - (100 / (1 + (gain_w / loss_w)))).iloc[-1])
+    gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean().ffill().bfill()
+    loss_w = (-delta_w.where(delta_w < 0, 0)).rolling(window=14).mean().ffill().bfill()
+    rs_w = gain_w / loss_w.replace(0, np.nan)
+    weekly_rsi = float((100 - (100 / (1 + rs_w))).iloc[-1])
+    if np.isnan(weekly_rsi): weekly_rsi = 50.0
     score_rsi = float(np.clip((weekly_rsi - 50) * (10 / 30), 0, 10))
 
     # 지표 3-1: VXN
     vxn_current = float(vxn_close_s.iloc[-1])
-    vxn_20d_ago = float(vxn_close_s.iloc[-20])
+    vxn_20d_ago = float(vxn_close_s.iloc[-20]) if len(vxn_close_s) >= 20 else vxn_current
     vxn_change_20d = vxn_current - vxn_20d_ago
-    qqq_20d_ret = ((current_close / float(qqq_close.iloc[-20])) - 1) * 100
+    qqq_ref = float(qqq_close.iloc[-20]) if len(qqq_close) >= 20 else current_close
+    qqq_20d_ret = ((current_close / qqq_ref) - 1) * 100
 
     score_vxn = 0.0
     vxn_status = "정상"
@@ -176,12 +188,16 @@ def calculate_ultra_risk_score():
 
     # 지표 3-2: SKEW
     skew_current = float(skew_close_s.iloc[-1])
+    if np.isnan(skew_current): skew_current = 125.0
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
     skew_status = "🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상"
 
-    # 지표 3-3: 기간구조
+    # 지표 3-3: 기간구조 (NaN 방어 로직)
     vix_val = float(vix_close_s.iloc[-1])
     vix3m_val = float(vix3m_close_s.iloc[-1])
+    if np.isnan(vix3m_val) or vix3m_val <= 0:
+        vix3m_val = vix_val * 1.1
+
     vix_ratio = round(vix_val / vix3m_val, 2)
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
@@ -193,7 +209,8 @@ def calculate_ultra_risk_score():
         qqqe = yf.download("QQQE", period="2mo", interval="1d", progress=False, auto_adjust=False)
         if not qqqe.empty:
             qqqe_close = clean_series(qqqe['Close'])
-            qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / float(qqqe_close.iloc[-20])) - 1) * 100
+            qqqe_ref = float(qqqe_close.iloc[-20]) if len(qqqe_close) >= 20 else float(qqqe_close.iloc[0])
+            qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
             breadth_divergence = qqq_20d_ret - qqqe_ret_20d
             if qqq_20d_ret > 0 and breadth_divergence >= 4.0:
                 score_breadth = 15.0
@@ -263,10 +280,10 @@ def calculate_ultra_risk_score():
     except Exception:
         liq_date_str = " ⚠️[API대체]"
 
-    total_score = round(
-        score_disp + score_rsi + score_vxn + score_skew + score_term +
-        score_breadth + score_pcr + score_hy + score_liq, 1
-    )
+    # 모든 스코어 NaN 방어 처리
+    scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
+    clean_scores = [0.0 if np.isnan(s) else s for s in scores]
+    total_score = round(sum(clean_scores), 1)
 
     # MACD 연산
     ema12 = qqq_close.ewm(span=12, adjust=False).mean()
