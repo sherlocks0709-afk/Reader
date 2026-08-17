@@ -88,6 +88,7 @@ def calculate_ultra_risk_score():
 
     # 1. 시세 및 선물 다운로드
     qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
+    tqqq = yf.download("TQQQ", period="1y", interval="1d", progress=False, auto_adjust=False)
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
     vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
     vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False, auto_adjust=False)
@@ -95,10 +96,11 @@ def calculate_ultra_risk_score():
     skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
 
     qqq_close = clean_series(qqq['Close'])
+    tqqq_close = clean_series(tqqq['Close']) if not tqqq.empty else qqq_close
     vix_close_s = clean_series(vix['Close']) if not vix.empty else pd.Series([18.0]*len(qqq_close), index=qqq_close.index)
     vxn_close_s = clean_series(vxn['Close']) if (not vxn.empty and len(vxn) >= 20) else vix_close_s
 
-    # VIX3M 결측치 완벽 방어
+    # VIX3M 결측치 방어
     if not vix3m.empty and len(vix3m) >= 5:
         vix3m_close_s = clean_series(vix3m['Close'])
     else:
@@ -112,8 +114,9 @@ def calculate_ultra_risk_score():
     df_tga, date_tga = fetch_fred_api("WTREGEN", fred_api_key)
     df_rrp, date_rrp = fetch_fred_api("RRPONTSYD", fred_api_key)
 
-    # 3. 선물 갭 감지
+    # 3. 주말/야간 선물 갭 감지
     fut_gap_status = ""
+    fut_gap_severe = False
     if not nq_fut.empty and len(nq_fut) >= 2:
         nq_close = clean_series(nq_fut['Close'])
         fut_curr = float(nq_close.iloc[-1])
@@ -121,9 +124,10 @@ def calculate_ultra_risk_score():
         if fut_prev > 0:
             fut_change = ((fut_curr / fut_prev) - 1) * 100
             if fut_change <= -1.5:
-                fut_gap_status = f"🚨 <b>[주말/야간 선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b> (돌발 악재 반영 중)\n"
+                fut_gap_severe = True
+                fut_gap_status = f"🚨 <b>[야간/주말 NQ선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
             elif fut_change >= 1.5:
-                fut_gap_status = f"🚀 <b>[주말/야간 선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
+                fut_gap_status = f"🚀 <b>[야간/주말 NQ선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
 
     # 4. 이동평균선 & 횡보장 감지용 볼린저 밴드
     sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
@@ -138,6 +142,7 @@ def calculate_ultra_risk_score():
     bb_width_s = ((bb_upper - bb_lower) / sma20_s) * 100
 
     current_close = float(qqq_close.iloc[-1])
+    current_tqqq = float(tqqq_close.iloc[-1])
     sma5 = float(sma5_s.iloc[-1])
     sma20 = float(sma20_s.iloc[-1])
     sma50 = float(sma50_s.iloc[-1])
@@ -145,7 +150,7 @@ def calculate_ultra_risk_score():
     disp_200 = float(disp200_s.iloc[-1])
     bb_width = float(bb_width_s.iloc[-1])
 
-    is_ranging_market = (bb_width <= 4.0)
+    is_ranging_market = (bb_width <= 4.0)  # 볼린저밴드 수축 횡보장 판별
     peak_52w = float(qqq_close.tail(252).max())
     drawdown = ((current_close / peak_52w) - 1) * 100
 
@@ -192,7 +197,7 @@ def calculate_ultra_risk_score():
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
     skew_status = "🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상"
 
-    # 지표 3-3: 기간구조 (NaN 방어 로직)
+    # 지표 3-3: 기간구조
     vix_val = float(vix_close_s.iloc[-1])
     vix3m_val = float(vix3m_close_s.iloc[-1])
     if np.isnan(vix3m_val) or vix3m_val <= 0:
@@ -243,9 +248,6 @@ def calculate_ultra_risk_score():
     # 지표 7: 순유동성
     score_liq = 0.0
     current_net_liq = 0.0
-    fed_assets_curr = 0.0
-    tga_curr = 0.0
-    rrp_curr = 0.0
     liq_change_4w = 0.0
     liq_status = "정상"
     liq_date_str = ""
@@ -260,9 +262,6 @@ def calculate_ultra_risk_score():
             current_net_liq = float(liq_df['Net_Liquidity'].iloc[-1])
             net_liq_4w_ago = float(liq_df['Net_Liquidity'].iloc[-5]) if len(liq_df) >= 5 else current_net_liq
             liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
-            fed_assets_curr = float(liq_df['WALCL'].iloc[-1]) / 1000
-            tga_curr = float(liq_df['WTREGEN'].iloc[-1]) / 1000
-            rrp_curr = float(liq_df['RRPONTSYD'].iloc[-1])
             
             latest_liq_date = liq_df['DATE'].iloc[-1]
             days_lag = (datetime.datetime.now() - latest_liq_date).days
@@ -280,7 +279,7 @@ def calculate_ultra_risk_score():
     except Exception:
         liq_date_str = " ⚠️[API대체]"
 
-    # 모든 스코어 NaN 방어 처리
+    # 점수 총합 연산
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
     total_score = round(sum(clean_scores), 1)
@@ -296,30 +295,64 @@ def calculate_ultra_risk_score():
     below_sma5 = (current_close < sma5)
     below_sma20 = (current_close < sma20)
 
-    # 고점 관리 지침
+    # 거시 역풍(Macro Headwind) 판별: 유동성 감소세 or 하이일드 4.0% 이상
+    is_macro_headwind = (liq_change_4w < -1.0) or (hy_current >= 4.0)
+
+    # ====================================================
+    # [전략 1] QQQ 1배수 정석 전략 지침 매핑
+    # ====================================================
     if total_score >= 80:
         if below_sma5 or macd_deadcross:
-            action_signal = "🚨 <b>[확률 95% 대세 고점 격발]</b>\n👉 <b>추가 50% 매도 실행 (총 현금 비중 80~100% 확보 및 풋/인버스 헤지)</b>"
+            qqq_action = "🚨 <b>[확률 95% 대세 고점 격발]</b> 👉 추가 50% 매도 (총 현금 비중 80~100% 확보)"
         else:
-            action_signal = "⚠️ <b>[대세 과열 - 추세 홀딩 중]</b>\n👉 5일선 지지 유지 중. 신규 매수 금지 및 5일선 이탈 즉시 50% 매도 대기"
+            qqq_action = "⚠️ <b>[대세 과열 - 추세 홀딩]</b> 👉 5일선 지지 중. 5일선 이탈 즉시 50% 매도 대기"
     elif total_score >= 65:
         if below_sma5 and macd_deadcross:
-            action_signal = "🚨 <b>[확률 90% 중기 조정 격발]</b>\n👉 <b>추가 30% 분할 매도 (총 현금 비중 50% 확보)</b>"
+            qqq_action = "🚨 <b>[확률 90% 중기 조정 격발]</b> 👉 추가 30% 분할 매도 (총 현금 비중 50% 확보)"
         elif below_sma5 or macd_deadcross:
-            action_signal = "⚠️ <b>[과열 구간 1차 균열]</b>\n👉 <b>전체 주식의 20% 1차 분할 익절 (현금 20% 확보)</b>"
+            qqq_action = "⚠️ <b>[과열 구간 1차 균열]</b> 👉 전체 주식의 20% 1차 분할 익절 (현금 20% 확보)"
         else:
-            action_signal = "⚖️ <b>[과열권 추세 지속 (거짓 경보 방지)]</b>\n👉 5일선 지지 지속. 섣부른 조기 매도 자제하고 100% 포지션 유지"
+            qqq_action = "⚖️ <b>[과열권 추세 지속 (거짓 경보 방지)]</b> 👉 5일선 지지 지속. 100% 포지션 유지"
     elif is_ranging_market and total_score < 65:
         if below_sma20:
-            action_signal = "⚠️ <b>[박스권 하단 이탈 경보]</b>\n👉 횡보 박스권 20일선 이탈. <b>보유 주식의 20% 비중 축소</b>"
+            qqq_action = "⚠️ <b>[박스권 하단 이탈 경보]</b> 👉 20일선 이탈. 보유 주식 20% 비중 축소"
         else:
-            action_signal = "📦 <b>[박스권 횡보 / 휩소 방지 모드]</b>\n👉 5일선 잔파도 무시, 20일선($" + f"{sma20:.2f}) 지지 확인하며 포지션 100% 유지"
+            qqq_action = "📦 <b>[박스권 횡보 / 휩소 방지]</b> 👉 5일선 잔파도 무시, 20일선 지지 확인하며 100% 유지"
     elif total_score >= 40:
-        action_signal = "🟢 <b>[건전한 추세 / 중립]</b>\n👉 기본 Buy & Hold (주식 비중 100% 유지)"
+        qqq_action = "🟢 <b>[건전한 추세 / 중립]</b> 👉 기본 Buy & Hold (주식 비중 100% 유지)"
     else:
-        action_signal = "🟢 <b>[안정 국면]</b>\n👉 주식 비중 100% 유지"
+        qqq_action = "🟢 <b>[안정 국면]</b> 👉 주식 비중 100% 유지"
 
-    # 바닥 탐색 모드 (-10% 하락 시)
+    # ====================================================
+    # [전략 2] TQQQ 3배수 기관급 레버리지 전략 지침 매핑
+    # ====================================================
+    if fut_gap_severe:
+        tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> NQ선물 -1.5% 이상 급락! 👉 <b>프리마켓/시초가 TQQQ 30% 선제 축소</b> (슬리피지 방어)"
+    elif total_score >= 80:
+        if below_sma5 or macd_deadcross:
+            tqqq_action = "🚨 <b>[TQQQ 3배수 대세 탈출]</b> 👉 <b>TQQQ 전량 매도 (현금 100% ➡️ SGOV 파킹)</b>\n   └ <i>연 4.5% 무위험 이자 수취 & 익년 세금(22%) 재원 확보</i>"
+        else:
+            tqqq_action = "⚠️ <b>[TQQQ 과열 추세 홀딩]</b> 👉 5일선 지지 중. 5일선 붕괴 즉시 전량 매도 준비"
+    elif total_score >= 65:
+        if below_sma5 and macd_deadcross:
+            tqqq_action = "🚨 <b>[TQQQ 중기 조정 격발]</b> 👉 <b>보유 TQQQ의 50% 분할 매도 (현금 50% SGOV 파킹)</b>"
+        elif below_sma5 or macd_deadcross:
+            tqqq_action = "⚠️ <b>[TQQQ 1차 균열]</b> 👉 <b>보유 TQQQ의 30% 1차 분할 익절 (SGOV 파킹)</b>"
+        else:
+            tqqq_action = "⚖️ <b>[TQQQ 과열 랠리 홀딩]</b> 👉 5일선 지지 지속. 섣부른 조기 매도 없이 100% 유지"
+    elif is_ranging_market and total_score < 65:
+        if below_sma20:
+            tqqq_action = "⚠️ <b>[TQQQ 박스권 하단 이탈]</b> 👉 20일선 붕괴. <b>TQQQ 50% 비중 축소 후 현금(SGOV) 대기</b>"
+        else:
+            tqqq_action = "🔒 <b>[TQQQ 횡보 휩소 방지 모드 (BB Width ≤ 4.0%)]</b> 👉 <b>5일선 잔파도 진입 금지!</b> 20일선 돌파 전까지 매수 보류"
+    elif total_score >= 40:
+        tqqq_action = "🟢 <b>[TQQQ 상승 추세 유지]</b> 👉 TQQQ 100% 포지션 유지 (본전스탑 트레일링 가동)"
+    else:
+        tqqq_action = "🟢 <b>[TQQQ 안정 국면]</b> 👉 TQQQ 100% 포지션 유지"
+
+    # ====================================================
+    # [바닥 탐색 모드 (-10% 하락 시 듀얼 매핑)]
+    # ====================================================
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
@@ -332,36 +365,62 @@ def calculate_ultra_risk_score():
         if not below_sma5: b_score += 25.0
         if not macd_deadcross: b_score += 25.0
 
+        # QQQ 1배수 바닥 매수 지침
         if b_score >= 75:
-            b_action = "💎 <b>[찐바닥 확정 / 전량 복귀]</b>\n👉 <b>잔여 현금 40% 전량 투입 (주식 비중 100% 완전 복귀)</b>"
+            qqq_b_action = "💎 <b>[찐바닥 확정]</b> 잔여 현금 40% 전량 투입 (주식 100% 완전 복귀)"
         elif b_score >= 50:
-            b_action = "🚀 <b>[2차 정석 비중 확대 구간]</b>\n👉 <b>보유 현금의 35% 2차 분할 매수 (누적 주식 비중 60%)</b>"
+            qqq_b_action = "🚀 <b>[2차 정석 비중 확대]</b> 보유 현금의 35% 2차 매수 (누적 주식 60%)"
         elif b_score >= 25:
-            b_action = "🟢 <b>[1차 공격적 정강이 매수]</b>\n👉 <b>보유 현금의 25% 1차 분할 매수 (누적 주식 비중 25%)</b>"
+            qqq_b_action = "🟢 <b>[1차 정강이 매수]</b> 보유 현금의 25% 1차 매수 (누적 주식 25%)"
         else:
-            b_action = "⏳ <b>[패닉 진행 중 / 칼날 잡기 금지]</b>\n👉 현금 100% 보존하며 바닥 신호 대기"
+            qqq_b_action = "⏳ <b>[패닉 진행 중]</b> 현금 100% 보존하며 바닥 신호 대기"
+
+        # TQQQ 3배수 기관급 바닥 매수 지침 (거시 역풍 시 50% 캡 & 분할 비율 차별화)
+        if is_macro_headwind:
+            headwind_tag = "⚠️ <b>[거시 역풍 구간 — TQQQ 투입 총량 50% 캡 제한]</b>\n"
+            if b_score >= 75:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>잔여 20% 투입 (누적 TQQQ 50% / 잔여 50%는 SGOV 보존)</b>\n   └ <i>수익률 +10% 도달 시 본전스탑(Break-Even) 필수</i>"
+            elif b_score >= 50:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 2차 매수 (누적 TQQQ 30% / SGOV 70%)</b>"
+            elif b_score >= 25:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 1차 매수 (누적 TQQQ 15% / SGOV 85%)</b>\n   └ <i>진입 평단 대비 -7% 이탈 시 즉시 손절 룰</i>"
+            else:
+                tqqq_b_action = f"{headwind_tag}   👉 SGOV 100% 파킹 유지하며 바닥 신호 대기"
+        else:
+            headwind_tag = "🟢 <b>[거시 순풍 구간 — TQQQ 100% 정상 투입 가능]</b>\n"
+            if b_score >= 75:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>잔여 현금 50% 전량 투입 (TQQQ 100% 완전 복귀)</b>"
+            elif b_score >= 50:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 35% 2차 매수 (누적 TQQQ 50%)</b>"
+            elif b_score >= 25:
+                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 1차 매수 (누적 TQQQ 15%)</b>"
+            else:
+                tqqq_b_action = f"{headwind_tag}   👉 현금(SGOV) 100% 보존 대기"
 
         bottom_section = (
             f"────────────────\n"
             f"🎯 <b>[정밀 바닥 탐색 모드 (고점 대비 {drawdown:.1f}%)]</b>\n"
-            f"• 바닥 완성도: <b>{b_score:.0f} / 100점</b>\n"
-            f"• VIX 피크아웃: {'🟢 완료 (패닉 통과)' if vix_peaked else '🔴 진행중'} | 기간구조: {'🟢 정상 콘탱고' if term_normalized else '🔴 백워데이션'}\n"
-            f"📢 <b>[바닥 매수 행동 지침]</b>\n{b_action}\n"
+            f"• 바닥 완성도: <b>{b_score:.0f} / 100점</b> (VIX 피크: {'🟢' if vix_peaked else '🔴'} | 기간구조: {'🟢' if term_normalized else '🔴'})\n\n"
+            f"📘 <b>[QQQ 1배수 바닥 지침]</b>\n{qqq_b_action}\n\n"
+            f"📙 <b>[TQQQ 3배수 기관급 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
 
     report = (
-        f"📊 <b>[QQQ 정밀 판독 보고서 (완전체)]</b>\n"
+        f"📊 <b>[QQQ & TQQQ 듀얼 전략 정밀 판독기]</b>\n"
         f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         f"{fut_gap_status}"
         f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"   └ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
+        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
+        f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
         f"🎯 <b>1단계 구조 점수: {total_score} / 100점</b>\n"
         f"⚡ <b>2단계 추세 상태:</b> {'🔴 5일선 이탈' if below_sma5 else '🟢 5일선 지지'} | {'🔴 MACD 데드' if macd_deadcross else '🟢 MACD 상승'}\n"
-        f"📢 <b>[고점 관리 지침]</b>\n{action_signal}\n"
+        f"────────────────\n"
+        f"📘 <b>[QQQ 1배수 정석 전략]</b>\n{qqq_action}\n\n"
+        f"📙 <b>[TQQQ 3배수 기관급 전략 (세금/스왑/갭 방어)]</b>\n{tqqq_action}\n"
         f"{bottom_section}"
         f"────────────────\n"
-        f"📈 <b>[시장 정밀 데이터]</b>\n"
+        f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
         f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://finance.yahoo.com/quote/%5EVIX3M'>기간구조</a>: {vix_ratio:.2f}\n"
         f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p\n"
