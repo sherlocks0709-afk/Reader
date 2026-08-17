@@ -3,9 +3,8 @@ name: Nasdaq QQQ Daily Ultra Monitor
 on:
   schedule:
     # UTC 기준 22:13 (일~금) = 한국 시간(KST) 매일 오전 07:13 (월~토) 발송
-    # :13분처럼 홀수 분을 지정하면 GitHub Actions 큐 지연 없이 1~2분 내 즉시 실행됩니다.
     - cron: '13 22 * * 0-5'
-  workflow_dispatch: # 언제든 GitHub 웹에서 'Run workflow'로 수동 즉시 실행 가능
+  workflow_dispatch:
 
 jobs:
   run-monitor:
@@ -18,7 +17,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
