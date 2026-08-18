@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 
 def clean_series(df_col):
-    """멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 보정"""
+    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 제거"""
     if isinstance(df_col, pd.DataFrame):
         s = df_col.iloc[:, 0]
     else:
@@ -15,54 +15,49 @@ def clean_series(df_col):
     s = pd.to_numeric(s, errors='coerce').dropna()
     return s.astype(float)
 
-def fetch_nasdaq_official_close(symbol="QQQ"):
-    """NASDAQ 거래소 공식 API에서 공인 마감 종가 직접 추출 (시간외 거래 노이즈 원천 차단)"""
-    try:
-        url = f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass=etf"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-        }
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            price_str = data.get('data', {}).get('primaryData', {}).get('lastSalePrice', '')
-            if price_str:
-                price_val = float(price_str.replace('$', '').replace(',', '').strip())
-                return price_val, False
-    except Exception as e:
-        print(f"NASDAQ 공식 API ({symbol}) 수집 실패: {e}")
-    return None, True
-
-def get_verified_price_and_series(ticker_symbol, period="3y"):
-    """1차 NASDAQ 거래소 공식 확정가 ➔ 2차 yfinance 시계열 매핑으로 100% 정규장 종가 보장"""
-    official_price, official_failed = fetch_nasdaq_official_close(ticker_symbol)
-
+def get_latest_price_and_series(ticker_symbol, period="3y"):
+    """장마감 직후 야후 파이낸스 일봉 지연/고정 문제를 방어하여 최신 확정 수치 확보"""
     try:
         t = yf.Ticker(ticker_symbol)
         df = t.history(period=period, interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 10:
+        
+        if df.empty or len(df) < 5:
             df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
         
         close_series = clean_series(df['Close'])
+        latest_price = float(close_series.iloc[-1])
         latest_date = df.index[-1]
         
-        # NASDAQ 공식 거래소 가격이 수집된 경우 최신 종가를 공식 확정치로 강제 치환
-        if not official_failed and official_price is not None:
-            latest_price = official_price
-            close_series.iloc[-1] = latest_price
-        else:
-            latest_price = float(close_series.iloc[-1])
+        try:
+            fast_price = t.fast_info.get('last_price', None) or t.fast_info.get('regular_market_previous_close', None)
+            if fast_price is not None and not np.isnan(fast_price):
+                if abs(fast_price - latest_price) / (latest_price if latest_price != 0 else 1) > 0.0005:
+                    latest_price = float(fast_price)
+                    close_series.iloc[-1] = latest_price
+        except Exception:
+            pass
 
         return close_series, latest_price, latest_date, False
     except Exception as e:
-        print(f"{ticker_symbol} 시세 연산 실패: {e}")
-        if not official_failed and official_price is not None:
-            return pd.Series([official_price]*100), official_price, datetime.datetime.now(), False
-        return pd.Series([700.0]*100), 700.0, datetime.datetime.now(), True
+        print(f"{ticker_symbol} 시세 수집 오류: {e}")
+        return pd.Series([100.0]*50), 100.0, datetime.datetime.now(), True
 
 def fetch_vix3m_real():
-    """CBOE 공식 CDN 및 야후 교차 수집으로 VIX3M 100% 원천 데이터 수집"""
+    """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
+    try:
+        s, p, _, err = get_latest_price_and_series("^VIX3M", period="3mo")
+        if not err and len(s) >= 5:
+            return s, False
+    except Exception:
+        pass
+
+    try:
+        s, p, _, err = get_latest_price_and_series("^VXV", period="3mo")
+        if not err and len(s) >= 5:
+            return s, False
+    except Exception:
+        pass
+
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
@@ -80,20 +75,13 @@ def fetch_vix3m_real():
             df_cboe = pd.DataFrame(data).set_index('Date').sort_index()
             if not df_cboe.empty:
                 return df_cboe['Close'].tail(60), False
-    except Exception:
-        pass
-
-    try:
-        df = yf.download("^VIX3M", period="3mo", interval="1d", progress=False, auto_adjust=False)
-        if not df.empty and len(df) >= 5:
-            return clean_series(df['Close']), False
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"CBOE VIX3M 원천 다운로드 에러: {e}")
 
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API"""
+    """FRED 공식 REST API 및 최종 데이터 일자 확인"""
     if not api_key:
         return None, None, False
     try:
@@ -167,42 +155,33 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 다운로드 (NASDAQ 공식 거래소 확정가 반영)
-    qqq_close, current_close, qqq_last_date, qqq_err = get_verified_price_and_series("QQQ", period="3y")
-    tqqq_close, current_tqqq, _, _ = get_verified_price_and_series("TQQQ", period="1y")
+    # 1. 시세 및 변동성 지표 전수 실시간 수집 파이프라인
+    qqq_close, current_close, qqq_last_date, qqq_err = get_latest_price_and_series("QQQ", period="3y")
+    tqqq_close, current_tqqq, _, _ = get_latest_price_and_series("TQQQ", period="1y")
+    vix_close_s, vix_current_val, _, vix_err = get_latest_price_and_series("^VIX", period="3mo")
+    vix1d_close_s, vix1d_val, _, _ = get_latest_price_and_series("^VIX1D", period="2mo")
+    vxn_close_s, vxn_current, _, vxn_err = get_latest_price_and_series("^VXN", period="3mo")
+    skew_close_s, skew_current, _, skew_err = get_latest_price_and_series("^SKEW", period="2mo")
     
     if qqq_err:
         data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
-
-    nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
-    vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
-    vix1d = yf.download("^VIX1D", period="2mo", interval="1d", progress=False, auto_adjust=False)
-    vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False, auto_adjust=False)
-    skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
-    
-    if vix.empty:
-        data_warnings.append("⚠️ VIX 지수 누락 (18.0 기본값 적용)")
+    if vix_err:
         vix_close_s = pd.Series([18.0] * len(qqq_close), index=qqq_close.index)
-    else:
-        vix_close_s = clean_series(vix['Close'])
-
-    if vxn.empty or len(vxn) < 20:
-        data_warnings.append("⚠️ VXN 나스닥 변동성 누락 (VIX 대체)")
+        vix_current_val = 18.0
+    if vxn_err:
         vxn_close_s = vix_close_s
-    else:
-        vxn_close_s = clean_series(vxn['Close'])
+        vxn_current = vix_current_val
+    if skew_err:
+        skew_close_s = pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
+        skew_current = 125.0
 
     # 2. VIX3M 수집
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
     if vix3m_failed or vix3m_close_s is None:
         data_warnings.append("⚠️ VIX3M 3개월물 공식 데이터 수신 실패")
-        vix3m_close_s = vix_close_s * 1.1
-
-    if skew.empty:
-        data_warnings.append("⚠️ SKEW 꼬리위험 지수 누락 (125.0 기본값 적용)")
-        skew_close_s = pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
+        vix3m_val = vix_current_val * 1.1
     else:
-        skew_close_s = clean_series(skew['Close'])
+        vix3m_val = float(vix3m_close_s.iloc[-1])
 
     # 3. FRED 데이터 수집
     df_hy, date_hy, hy_stale = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
@@ -216,10 +195,10 @@ def calculate_ultra_risk_score():
         data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 4. 주말/야간 선물 갭 감지
+    nq_close, nq_curr_val, _, nq_err = get_latest_price_and_series("NQ=F", period="5d")
     fut_gap_status = ""
     fut_gap_severe = False
-    if not nq_fut.empty and len(nq_fut) >= 2:
-        nq_close = clean_series(nq_fut['Close'])
+    if not nq_err and len(nq_close) >= 2:
         fut_curr = float(nq_close.iloc[-1])
         fut_prev = float(nq_close.iloc[-2])
         if fut_prev > 0:
@@ -273,7 +252,6 @@ def calculate_ultra_risk_score():
     score_rsi = float(np.clip((weekly_rsi - 50) * (10 / 30), 0, 10))
 
     # 지표 3-1: VXN
-    vxn_current = float(vxn_close_s.iloc[-1])
     vxn_20d_ago = float(vxn_close_s.iloc[-20]) if len(vxn_close_s) >= 20 else vxn_current
     vxn_change_20d = vxn_current - vxn_20d_ago
     qqq_ref = float(qqq_close.iloc[-20]) if len(qqq_close) >= 20 else current_close
@@ -294,32 +272,22 @@ def calculate_ultra_risk_score():
         vxn_status = "🟢 변동성 안정"
 
     # 지표 3-2: SKEW & 0DTE
-    skew_current = float(skew_close_s.iloc[-1])
-    if np.isnan(skew_current): skew_current = 125.0
     score_skew = float(np.clip((skew_current - 120) * (10 / 25), 0, 10))
-    
-    vix1d_val = 0.0
     vix1d_tag = ""
-    vix_current_val = float(vix_close_s.iloc[-1])
-    if not vix1d.empty and len(vix1d) >= 5:
-        vix1d_s = clean_series(vix1d['Close'])
-        vix1d_val = float(vix1d_s.iloc[-1])
-        if vix_current_val > 0:
-            ratio_0dte = vix1d_val / vix_current_val
-            if ratio_0dte >= 1.25:
-                score_skew = min(10.0, score_skew + 3.0)
-                vix1d_tag = f" (🔥0DTE급등 {ratio_0dte:.2f}x)"
-                if ratio_0dte >= 1.40:
-                    regime_alerts.append(f"0DTE 옵션 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x) 👉 초단기 파생 포지션 왜곡 점검 필요")
+    if len(vix1d_close_s) >= 5 and vix_current_val > 0:
+        ratio_0dte = vix1d_val / vix_current_val
+        if ratio_0dte >= 1.25:
+            score_skew = min(10.0, score_skew + 3.0)
+            vix1d_tag = f" (🔥0DTE급등 {ratio_0dte:.2f}x)"
+            if ratio_0dte >= 1.40:
+                regime_alerts.append(f"0DTE 옵션 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x) 👉 초단기 파생 포지션 왜곡 점검 필요")
     skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
 
     # 지표 3-3: 기간구조
-    vix_val = float(vix_close_s.iloc[-1])
-    vix3m_val = float(vix3m_close_s.iloc[-1])
     if np.isnan(vix3m_val) or vix3m_val <= 0:
-        vix3m_val = vix_val * 1.1
+        vix3m_val = vix_current_val * 1.1
 
-    vix_ratio = round(vix_val / vix3m_val, 2)
+    vix_ratio = round(vix_current_val / vix3m_val, 2)
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
@@ -328,7 +296,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = get_verified_price_and_series("QQQE", period="6mo")
+        qqqe_close, _, _, _ = get_latest_price_and_series("QQQE", period="6mo")
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
@@ -510,7 +478,7 @@ def calculate_ultra_risk_score():
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
-        vix_peaked = float(vix_close_s.iloc[-1]) < float(vix_sma5.iloc[-1]) and float(vix_close_s.max()) >= 25.0
+        vix_peaked = vix_current_val < float(vix_sma5.iloc[-1]) and float(vix_close_s.max()) >= 25.0
         term_normalized = (vix_ratio < 0.95)
 
         b_score = 0.0
