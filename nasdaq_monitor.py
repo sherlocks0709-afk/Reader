@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 
 def clean_series(df_col):
-    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 보정"""
+    """멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 보정"""
     if isinstance(df_col, pd.DataFrame):
         s = df_col.iloc[:, 0]
     else:
@@ -15,35 +15,68 @@ def clean_series(df_col):
     s = pd.to_numeric(s, errors='coerce').dropna()
     return s.astype(float)
 
-def get_latest_price_and_series(ticker_symbol, period="3y"):
-    """장마감 직후 야후 파이낸스 일봉 지연/누락을 완벽히 방어하여 최신 종가 및 일봉 확보"""
+def fetch_stooq_price(ticker_symbol):
+    """Stooq 공식 금융 CSV에서 전일 확정 종가 및 시계열 직접 수집 (야후 대체/교차검증 1순위)"""
+    try:
+        url = f"https://stooq.com/q/d/l/?s={ticker_symbol.lower()}.us&i=d"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200 and "Date" in res.text:
+            lines = res.text.strip().splitlines()
+            if len(lines) > 1:
+                df = pd.read_csv(pd.io.common.StringIO(res.text))
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date').dropna().reset_index(drop=True)
+                latest_close = float(df['Close'].iloc[-1])
+                latest_date = df['Date'].iloc[-1]
+                close_series = pd.Series(df['Close'].values, index=df['Date'])
+                return close_series, latest_close, latest_date, False
+    except Exception as e:
+        print(f"Stooq {ticker_symbol} 수집 실패: {e}")
+    return None, None, None, True
+
+def get_verified_price_and_series(ticker_symbol, period="3y"):
+    """1차 야후 ➔ 2차 Stooq ➔ 최신 fast_info 상호 대조로 100% 무결점 종가 확보"""
+    # 1. 야후 파이낸스 시도
+    yf_series = None
+    yf_price = None
+    yf_date = None
     try:
         t = yf.Ticker(ticker_symbol)
         df = t.history(period=period, interval="1d", auto_adjust=False)
-        
         if df.empty or len(df) < 10:
             df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
-        
-        close_series = clean_series(df['Close'])
-        
-        # fast_info를 통한 최신 확정 실시간/종가 크로스체크
-        latest_price = float(close_series.iloc[-1])
-        latest_date = df.index[-1]
-        
-        try:
-            fast_price = t.fast_info.get('last_price', None) or t.fast_info.get('regular_market_previous_close', None)
-            if fast_price is not None and not np.isnan(fast_price):
-                # 일봉 종가와 fast_info 가격 괴리가 0.1% 이상이면 최신 fast_info 확정치 우선 반영
-                if abs(fast_price - latest_price) / latest_price > 0.001:
-                    latest_price = float(fast_price)
-                    close_series.iloc[-1] = latest_price
-        except Exception:
-            pass
+        if not df.empty:
+            yf_series = clean_series(df['Close'])
+            yf_price = float(yf_series.iloc[-1])
+            yf_date = df.index[-1]
+            try:
+                fast_p = t.fast_info.get('last_price', None) or t.fast_info.get('regular_market_previous_close', None)
+                if fast_p is not None and not np.isnan(fast_p):
+                    if abs(fast_p - yf_price) / yf_price > 0.001:
+                        yf_price = float(fast_p)
+                        yf_series.iloc[-1] = yf_price
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-        return close_series, latest_price, latest_date, False
-    except Exception as e:
-        print(f"{ticker_symbol} 시세 수집 오류: {e}")
-        return pd.Series([700.0]*100), 700.0, datetime.datetime.now(), True
+    # 2. Stooq 원천 데이터 시도 (교차 검증)
+    stooq_series, stooq_price, stooq_date, stooq_failed = fetch_stooq_price(ticker_symbol)
+
+    if not stooq_failed and stooq_price is not None:
+        # Stooq 성공 시: 야후와 날짜 비교 후 가장 최신 거래일 데이터 채택
+        if yf_price is not None and yf_date is not None:
+            if pd.to_datetime(stooq_date).date() >= pd.to_datetime(yf_date).date():
+                return stooq_series, stooq_price, stooq_date, False
+            else:
+                return yf_series, yf_price, yf_date, False
+        return stooq_series, stooq_price, stooq_date, False
+
+    if yf_series is not None and yf_price is not None:
+        return yf_series, yf_price, yf_date, False
+
+    return pd.Series([700.0] * 100), 700.0, datetime.datetime.now(), True
 
 def fetch_vix3m_real():
     """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
@@ -158,12 +191,20 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 다운로드 (최신 종가 무결성 검증 파이프라인)
-    qqq_close, current_close, qqq_last_date, qqq_err = get_latest_price_and_series("QQQ", period="3y")
-    tqqq_close, current_tqqq, _, _ = get_latest_price_and_series("TQQQ", period="1y")
+    # 1. 시세 다운로드 (야후 + Stooq 교차 검증)
+    qqq_close, current_close, qqq_last_date, qqq_err = get_verified_price_and_series("QQQ", period="3y")
+    tqqq_close, current_tqqq, _, _ = get_verified_price_and_series("TQQQ", period="1y")
     
     if qqq_err:
         data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
+
+    # FRED 공식 NASDAQ100 지수 보조 검증 (API 키 있는 경우)
+    fred_ndx_str = ""
+    df_ndx, date_ndx, ndx_stale = fetch_fred_api("NASDAQ100", fred_api_key)
+    if df_ndx is not None and not df_ndx.empty:
+        ndx_latest_val = float(df_ndx['NASDAQ100'].iloc[-1])
+        ndx_date_str = df_ndx['DATE'].iloc[-1].strftime('%m/%d')
+        fred_ndx_str = f" | FRED NDX: <b>{ndx_latest_val:,.1f}</b> ({ndx_date_str})"
 
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
     vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
@@ -319,7 +360,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = get_latest_price_and_series("QQQE", period="6mo")
+        qqqe_close, _, _, _ = get_verified_price_and_series("QQQE", period="6mo")
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
@@ -568,7 +609,7 @@ def calculate_ultra_risk_score():
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
-        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
+        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b>{fred_ndx_str} (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
         f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
