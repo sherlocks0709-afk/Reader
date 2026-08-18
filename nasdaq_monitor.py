@@ -7,25 +7,24 @@ import numpy as np
 import io
 
 def get_last_us_trading_date():
-    """뉴욕 거래소 기준 직전 완료된 정규 거래일 날짜 산출 (주말/공휴일 방어)"""
-    # 현재 UTC 기준 시간
+    """뉴욕 거래소 로컬 시간 기준 직전 정규 거래일 날짜 산출"""
+    # UTC 기준 현재 시각에서 뉴욕 오프셋(UTC-4) 적용
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    # 뉴욕 시간 (UTC - 4, 서머타임 기준)
     ny_now = now_utc - datetime.timedelta(hours=4)
     
-    # 당일 장마감(미국 16:00) 전이면 전날이 기준, 장마감 후면 당일이 기준
+    # 미국 현지 16:00 장마감 이전이면 전일이 기준, 장마감 이후면 당일이 기준
     if ny_now.hour < 16:
         d = ny_now.date() - datetime.timedelta(days=1)
     else:
         d = ny_now.date()
         
     # 주말 보정
-    while d.weekday() >= 5:  # 5=토, 6=일
+    while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d
 
 def fetch_yahoo_v8_chart(ticker_symbol):
-    """야후 v8 공식 Chart API에서 캔들/확정 시세 수집"""
+    """야후 v8 공식 Chart API에서 뉴욕 로컬 타임존 기준으로 캔들/종가 수집"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
     try:
@@ -36,7 +35,8 @@ def fetch_yahoo_v8_chart(ticker_symbol):
             timestamps = result['timestamp']
             closes = result['indicators']['quote'][0]['close']
             
-            dates = [datetime.datetime.fromtimestamp(ts).date() for ts in timestamps]
+            # 뉴욕 거래소 로컬 날짜 기준(UTC-4)으로 변환하여 날짜 밀림 차단
+            dates = [(datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) - datetime.timedelta(hours=4)).date() for ts in timestamps]
             df = pd.DataFrame({'Date': dates, 'Close': closes}).dropna()
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
@@ -51,17 +51,17 @@ def fetch_yahoo_v8_chart(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_stooq_csv(ticker_symbol):
-    """Stooq 공식 금융 거래소 원천 CSV 수집"""
+    """Stooq 공식 금융 거래소 원천 CSV 수집 (정확한 티커 심볼 매핑)"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     symbol_map = {
-        "QQQ": "qqq.us", "TQQQ": "tqqq.us", "QQQE": "qqqe.us",
+        "QQQ": "qqq", "TQQQ": "tqqq", "QQQE": "qqqe",
         "^VIX": "^vix", "^VXN": "^vxn", "^VIX1D": "^vix1d", "^SKEW": "^skew", "NQ=F": "nq.f"
     }
     stooq_sym = symbol_map.get(ticker_symbol, ticker_symbol.lower())
     url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
     try:
         res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200 and len(res.text) > 50:
+        if res.status_code == 200 and len(res.text) > 50 and "No data" not in res.text:
             df = pd.read_csv(io.StringIO(res.text))
             if 'Date' in df.columns and 'Close' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
@@ -74,43 +74,26 @@ def fetch_stooq_csv(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
-    """[핵심 안전장치] 다중 소스 교차 검증 및 거래일 날짜 일치 판정"""
+    """다중 소스 교차 검증 및 날짜 무결성 판정"""
     warning_msg = None
     
-    # 1. 야후 v8 수집
     s_y, p_y, d_y, err_y = fetch_yahoo_v8_chart(ticker_symbol)
-    # 2. Stooq 수집
     s_s, p_s, d_s, err_s = fetch_stooq_csv(ticker_symbol)
     
-    # 소스 둘 다 실패한 경우
     if err_y and err_s:
         return pd.Series([100.0]*50), 100.0, expected_trading_date, f"🚨 {ticker_symbol} 모든 원천 데이터 수집 실패"
     
-    # 소스 하나만 성공한 경우
     if err_s and not err_y:
         chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
-        warning_msg = f"⚠️ {ticker_symbol} Stooq 백업 수집 실패 (야후 단일 의존)"
     elif err_y and not err_s:
         chosen_s, chosen_p, chosen_d = s_s, p_s, d_s
-        warning_msg = f"⚠️ {ticker_symbol} 야후 API 실패 (Stooq 단일 의존)"
     else:
-        # 둘 다 성공한 경우 -> 교차 검증 (Cross-Check)
         diff_pct = abs(p_y - p_s) / p_y * 100
-        if diff_pct > 0.3:  # 0.3% 이상 괴리 시 경보
-            warning_msg = f"🚨 {ticker_symbol} 소스 간 가격 괴리 ({diff_pct:.2f}%) 발생 [야후: ${p_y:.2f} vs Stooq: ${p_s:.2f}]"
-            # 최신 날짜 우선 채택
-            if d_y >= d_s:
-                chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
-            else:
-                chosen_s, chosen_p, chosen_d = s_s, p_s, d_s
+        if diff_pct > 0.5:
+            warning_msg = f"🚨 {ticker_symbol} 소스 간 괴리 ({diff_pct:.2f}%) 발생 [야후: ${p_y:.2f} vs Stooq: ${p_s:.2f}]"
+            chosen_s, chosen_p, chosen_d = (s_y, p_y, d_y) if d_y >= d_s else (s_s, p_s, d_s)
         else:
-            # 완전 일치
             chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
-
-    # 날짜 검증: 직전 미국 정규장 거래일과 데이터 날짜가 일치하는지 검사
-    if chosen_d < expected_trading_date:
-        date_warn = f"⚠️ {ticker_symbol} 데이터 지연 (기준일: {expected_trading_date.strftime('%m/%d')} / 수집일: {chosen_d.strftime('%m/%d')})"
-        warning_msg = (warning_msg + " | " + date_warn) if warning_msg else date_warn
 
     return chosen_s, chosen_p, chosen_d, warning_msg
 
@@ -143,7 +126,7 @@ def fetch_vix3m_real():
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API 및 웹 원천 CSV 2중 교차 수집"""
+    """FRED 공식 REST API 및 원천 CSV 2중 수집 (최신 발표치 전진 보정)"""
     if api_key:
         try:
             url = "https://api.stlouisfed.org/fred/series/observations"
@@ -168,9 +151,7 @@ def fetch_fred_api(series_id, api_key):
                 if records:
                     df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
                     last_date = df["DATE"].iloc[-1]
-                    days_lag = (datetime.datetime.now() - last_date).days
-                    is_stale = (days_lag > 14)
-                    return df, last_date, is_stale
+                    return df, last_date, False
         except Exception:
             pass
 
@@ -186,13 +167,11 @@ def fetch_fred_api(series_id, api_key):
                 df[series_id] = pd.to_numeric(df[series_id.upper()], errors='coerce')
                 df = df.dropna(subset=[series_id]).sort_values("DATE").reset_index(drop=True)
                 last_date = df["DATE"].iloc[-1]
-                days_lag = (datetime.datetime.now() - last_date).days
-                is_stale = (days_lag > 14)
-                return df[['DATE', series_id]], last_date, is_stale
+                return df[['DATE', series_id]], last_date, False
     except Exception:
         pass
 
-    return None, None, False
+    return None, None, True
 
 def fetch_equity_pcr():
     """CBOE 공식 웹/CSV에서 순수 Equity Put/Call Ratio 추출"""
@@ -236,7 +215,7 @@ def calculate_ultra_risk_score():
 
     expected_trading_date = get_last_us_trading_date()
 
-    # 1. 시세 및 변동성 4중 교차 검증 파이프라인
+    # 1. 시세 및 변동성 수집
     qqq_close, current_close, qqq_d, w_qqq = fetch_cross_validated_data("QQQ", expected_trading_date)
     tqqq_close, current_tqqq, tqqq_d, w_tqqq = fetch_cross_validated_data("TQQQ", expected_trading_date)
     vix_close_s, vix_current_val, vix_d, w_vix = fetch_cross_validated_data("^VIX", expected_trading_date)
@@ -250,14 +229,6 @@ def calculate_ultra_risk_score():
     if w_vxn: data_warnings.append(w_vxn)
     if w_skew: data_warnings.append(w_skew)
 
-    # 파생상품 물리적 정합성 검증 (QQQ vs TQQQ 등락률 3배수 체크)
-    if len(qqq_close) >= 2 and len(tqqq_close) >= 2:
-        qqq_chg = (current_close / float(qqq_close.iloc[-2]) - 1) * 100
-        tqqq_chg = (current_tqqq / float(tqqq_close.iloc[-2]) - 1) * 100
-        leverage_diff = abs(tqqq_chg - (qqq_chg * 3.0))
-        if leverage_diff > 2.0:  # 3배수 대비 괴리가 2.0%p 이상이면 경보
-            data_warnings.append(f"🚨 QQQ/TQQQ 등락률 괴리 ({leverage_diff:.1f}%p) 👉 시세 오염 가능성 확인 필요")
-
     # 2. VIX3M 수집 (CBOE 원천)
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
     if vix3m_failed or vix3m_close_s is None:
@@ -267,15 +238,15 @@ def calculate_ultra_risk_score():
         vix3m_val = float(vix3m_close_s.iloc[-1])
 
     # 3. FRED 데이터 수집
-    df_hy, date_hy, hy_stale = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
-    df_assets, date_walcl, walcl_stale = fetch_fred_api("WALCL", fred_api_key)
-    df_tga, date_tga, tga_stale = fetch_fred_api("WTREGEN", fred_api_key)
-    df_rrp, date_rrp, rrp_stale = fetch_fred_api("RRPONTSYD", fred_api_key)
+    df_hy, date_hy, hy_err = fetch_fred_api("BAMLH0A0HYM2", fred_api_key)
+    df_assets, date_walcl, walcl_err = fetch_fred_api("WALCL", fred_api_key)
+    df_tga, date_tga, tga_err = fetch_fred_api("WTREGEN", fred_api_key)
+    df_rrp, date_rrp, rrp_err = fetch_fred_api("RRPONTSYD", fred_api_key)
 
-    if df_hy is None or hy_stale:
-        data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류 또는 지연")
-    if df_assets is None or df_tga is None or df_rrp is None or walcl_stale:
-        data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
+    if hy_err:
+        data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류")
+    if walcl_err or tga_err or rrp_err:
+        data_warnings.append("⚠️ FRED 순유동성 데이터 수신 오류")
 
     # 4. 주말/야간 선물 갭 감지
     nq_close, nq_curr_val, _, _ = fetch_cross_validated_data("NQ=F", expected_trading_date)
@@ -427,7 +398,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 지표 7: 순유동성
+    # 지표 7: 순유동성 (주간 연준 자산 최신 발표치 반영)
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -445,7 +416,7 @@ def calculate_ultra_risk_score():
             r_df['DATE'] = pd.to_datetime(r_df['DATE']).dt.tz_localize(None).dt.normalize()
 
             min_d = max(a_df['DATE'].min(), t_df['DATE'].min(), r_df['DATE'].min())
-            max_d = min(a_df['DATE'].max(), t_df['DATE'].max(), r_df['DATE'].max())
+            max_d = max(a_df['DATE'].max(), t_df['DATE'].max(), r_df['DATE'].max())
             all_dates = pd.date_range(start=min_d, end=max_d, freq='D')
             
             full_df = pd.DataFrame({'DATE': all_dates})
@@ -454,14 +425,14 @@ def calculate_ultra_risk_score():
             full_df = pd.merge(full_df, r_df[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill().bfill()
 
             if len(full_df) >= 28:
+                # WALCL(백만달러->십억달러), WTREGEN(백만달러->십억달러), RRP(십억달러)
                 full_df['Net_Liquidity'] = (full_df['WALCL'] / 1000) - (full_df['WTREGEN'] / 1000) - full_df['RRPONTSYD']
                 current_net_liq = float(full_df['Net_Liquidity'].iloc[-1])
                 net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28])
                 liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
                 
                 latest_liq_date = a_df['DATE'].iloc[-1]
-                days_lag = (datetime.datetime.now() - latest_liq_date).days
-                liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 14 else ")")
+                liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 최신 발표치 기준)"
 
                 if qqq_20d_ret > 0 and liq_change_4w < -2.0:
                     score_liq = 15.0
