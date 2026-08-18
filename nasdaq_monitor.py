@@ -15,41 +15,58 @@ def clean_series(df_col):
     s = pd.to_numeric(s, errors='coerce').dropna()
     return s.astype(float)
 
-def get_exact_daily_data(ticker_symbol, period="3y"):
-    """캐싱 오류 없는 순수 일봉 데이터 및 최종 확정 종가 추출 (fast_info 왜곡 제거)"""
+def fetch_realtime_yahoo_chart(ticker_symbol):
+    """야후 v8 REST API를 직접 호출하여 캐싱 없이 100% 최신 실시간/마감 종가 추출"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?interval=1d&range=1mo"
     try:
-        # download 방식으로 일봉 수집
-        df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
-        if df.empty or len(df) < 5:
-            # history 백업 시도
-            t = yf.Ticker(ticker_symbol)
-            df = t.history(period=period, interval="1d", auto_adjust=False)
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            result = data['chart']['result'][0]
+            timestamps = result['timestamp']
+            closes = result['indicators']['quote'][0]['close']
             
-        close_series = clean_series(df['Close'])
-        latest_price = float(close_series.iloc[-1])
-        latest_date = df.index[-1]
-        
-        return close_series, latest_price, latest_date, False
+            valid_data = []
+            for t, c in zip(timestamps, closes):
+                if c is not None and not np.isnan(c):
+                    valid_data.append({'Date': pd.to_datetime(t, unit='s'), 'Close': float(c)})
+            
+            if valid_data:
+                df = pd.DataFrame(valid_data).set_index('Date').sort_index()
+                return df['Close'], float(df['Close'].iloc[-1]), df.index[-1], False
     except Exception as e:
-        print(f"{ticker_symbol} 시세 수집 오류: {e}")
-        return pd.Series([100.0]*50), 100.0, datetime.datetime.now(), True
+        print(f"{ticker_symbol} 실시간 API 오류: {e}")
+    return None, None, None, True
+
+def get_exact_daily_data(ticker_symbol, period="3y"):
+    """일봉과 실시간 REST API를 병합하여 지연 및 고정 현상을 원천 차단"""
+    # 1차: 실시간 v8 API 직접 조회 (장마감 최신 데이터)
+    s_rt, p_rt, d_rt, err_rt = fetch_realtime_yahoo_chart(ticker_symbol)
+    
+    # 2차: 장기 히스토리 다운로드
+    try:
+        df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
+        close_series = clean_series(df['Close'])
+    except Exception:
+        close_series = pd.Series([100.0]*50)
+    
+    if not err_rt and s_rt is not None and not s_rt.empty:
+        # 실시간 최신 종가가 일봉 데이터보다 최신이면 결합
+        if close_series.empty or d_rt.date() >= close_series.index[-1].date():
+            if not close_series.empty and d_rt.date() == close_series.index[-1].date():
+                close_series.iloc[-1] = p_rt
+            else:
+                close_series = pd.concat([close_series, pd.Series([p_rt], index=[d_rt])])
+            return close_series, p_rt, d_rt, False
+            
+    if not close_series.empty:
+        return close_series, float(close_series.iloc[-1]), close_series.index[-1], False
+
+    return pd.Series([100.0]*50), 100.0, datetime.datetime.now(), True
 
 def fetch_vix3m_real():
-    """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
-    try:
-        s, p, _, err = get_exact_daily_data("^VIX3M", period="3mo")
-        if not err and len(s) >= 5:
-            return s, False
-    except Exception:
-        pass
-
-    try:
-        s, p, _, err = get_exact_daily_data("^VXV", period="3mo")
-        if not err and len(s) >= 5:
-            return s, False
-    except Exception:
-        pass
-
+    """CBOE 공식 CDN CSV 및 REST API를 통해 VIX3M 100% 정밀도 보장"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
@@ -69,6 +86,10 @@ def fetch_vix3m_real():
                 return df_cboe['Close'].tail(60), False
     except Exception as e:
         print(f"CBOE VIX3M 원천 다운로드 에러: {e}")
+
+    s, _, _, err = get_exact_daily_data("^VIX3M", period="3mo")
+    if not err and len(s) >= 5:
+        return s, False
 
     return None, True
 
@@ -147,7 +168,7 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 및 변동성 지표 전수 수집
+    # 1. 시세 및 변동성 지표 전수 수집 (v8 실시간 API 직결)
     qqq_close, current_close, qqq_last_date, qqq_err = get_exact_daily_data("QQQ", period="3y")
     tqqq_close, current_tqqq, _, _ = get_exact_daily_data("TQQQ", period="1y")
     vix_close_s, vix_current_val, _, vix_err = get_exact_daily_data("^VIX", period="3mo")
