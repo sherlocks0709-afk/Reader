@@ -1,25 +1,27 @@
 import datetime
 import os
 import re
+import io
 import requests
 import pandas as pd
 import numpy as np
-import io
+from zoneinfo import ZoneInfo
 
 def get_kst_now():
-    """UTC 서버 환경에서 무조건 한국 표준시(KST, UTC+9) 반환"""
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+    """한국 표준시(KST, Asia/Seoul) 정확한 현재 시각 반환"""
+    return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
 
 def get_last_us_trading_date():
-    """뉴욕 거래소 로컬 시간 기준 직전 정규 거래일 날짜 산출"""
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    ny_now = now_utc - datetime.timedelta(hours=4)
+    """서머타임 자동 적용 뉴욕 거래소 기준 직전 정규 거래일 날짜 산출"""
+    ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
     
+    # 미국 현지 16:00 정규장 마감 이전이면 전일이 기준, 이후면 당일이 기준
     if ny_now.hour < 16:
         d = ny_now.date() - datetime.timedelta(days=1)
     else:
         d = ny_now.date()
         
+    # 주말 보정 (토=5, 일=6)
     while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d
@@ -36,7 +38,10 @@ def fetch_yahoo_v8_chart(ticker_symbol):
             timestamps = result['timestamp']
             closes = result['indicators']['quote'][0]['close']
             
-            dates = [(datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) - datetime.timedelta(hours=4)).date() for ts in timestamps]
+            # 뉴욕 로컬 타임존 기준 날짜 변환 (서머타임 자동 대응)
+            ny_tz = ZoneInfo("America/New_York")
+            dates = [datetime.datetime.fromtimestamp(ts, tz=ny_tz).date() for ts in timestamps]
+            
             df = pd.DataFrame({'Date': dates, 'Close': closes}).dropna()
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
@@ -125,7 +130,7 @@ def fetch_vix3m_real():
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API에서 최신 데이터 역순 수집 후 정렬"""
+    """FRED 공식 REST API 및 원천 CSV 2중 수집"""
     if api_key:
         try:
             url = "https://api.stlouisfed.org/fred/series/observations"
@@ -342,33 +347,33 @@ def calculate_ultra_risk_score():
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 4: QQQ vs QQQE 쏠림
+    # 지표 4: QQQ vs QQQE 쏠림 (결측치 정합성 안전 매칭)
     score_breadth = 0.0
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
         qqqe_close, _, _, _ = fetch_cross_validated_data("QQQE", expected_trading_date)
         if not qqqe_close.empty and len(qqqe_close) >= 20:
-            qqqe_ref = float(qqqe_close.iloc[-20])
-            qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
-            breadth_divergence = qqq_20d_ret - qqqe_ret_20d
-            
-            qqq_roll_20 = qqq_close.pct_change(20) * 100
-            qqqe_roll_20 = qqqe_close.pct_change(20) * 100
-            diff_series = (qqq_roll_20 - qqqe_roll_20).dropna()
-            if len(diff_series) >= 40:
-                diff_mean = float(diff_series.mean())
-                diff_std = float(diff_series.std())
-                z_breadth = (breadth_divergence - diff_mean) / diff_std if diff_std > 0 else 0.0
-                if qqq_20d_ret > 0 and z_breadth >= 2.0:
-                    score_breadth = 15.0
-                elif qqq_20d_ret > 0 and z_breadth >= 1.0:
-                    score_breadth = 7.5
-                if abs(z_breadth) >= 2.8:
-                    regime_alerts.append(f"빅테크 vs 동일가중 쏠림도 임계 돌파 ({z_breadth:+.2f}σ) 👉 지수 양극화 체제 변화 점검 필요")
-            else:
-                if qqq_20d_ret > 0 and breadth_divergence >= 4.0: score_breadth = 15.0
-                elif qqq_20d_ret > 0 and breadth_divergence >= 2.0: score_breadth = 7.5
+            aligned_df = pd.DataFrame({'QQQ': qqq_close, 'QQQE': qqqe_close}).dropna()
+            if len(aligned_df) >= 20:
+                qqq_al_ret = ((aligned_df['QQQ'].iloc[-1] / aligned_df['QQQ'].iloc[-20]) - 1) * 100
+                qqqe_al_ret = ((aligned_df['QQQE'].iloc[-1] / aligned_df['QQQE'].iloc[-20]) - 1) * 100
+                breadth_divergence = qqq_al_ret - qqqe_al_ret
+                
+                diff_series = (aligned_df['QQQ'].pct_change(20) - aligned_df['QQQE'].pct_change(20)).dropna() * 100
+                if len(diff_series) >= 30:
+                    diff_mean = float(diff_series.mean())
+                    diff_std = float(diff_series.std())
+                    z_breadth = (breadth_divergence - diff_mean) / diff_std if diff_std > 0 else 0.0
+                    if qqq_20d_ret > 0 and z_breadth >= 2.0:
+                        score_breadth = 15.0
+                    elif qqq_20d_ret > 0 and z_breadth >= 1.0:
+                        score_breadth = 7.5
+                    if abs(z_breadth) >= 2.8:
+                        regime_alerts.append(f"빅테크 vs 동일가중 쏠림도 임계 돌파 ({z_breadth:+.2f}σ) 👉 지수 양극화 체제 변화 점검 필요")
+                else:
+                    if qqq_20d_ret > 0 and breadth_divergence >= 4.0: score_breadth = 15.0
+                    elif qqq_20d_ret > 0 and breadth_divergence >= 2.0: score_breadth = 7.5
         else:
             data_warnings.append("⚠️ QQQE(동일가중) 데이터 수신 누락")
     except Exception:
@@ -397,7 +402,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 지표 7: 순유동성
+    # 지표 7: 순유동성 (정밀 시계열 병합 및 안전 연산)
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -406,30 +411,20 @@ def calculate_ultra_risk_score():
 
     try:
         if df_assets is not None and df_tga is not None and df_rrp is not None:
-            a_df = df_assets.copy()
-            t_df = df_tga.copy()
-            r_df = df_rrp.copy()
+            a_df = df_assets.copy().rename(columns={'DATE': 'Date'}).set_index('Date')
+            t_df = df_tga.copy().rename(columns={'DATE': 'Date'}).set_index('Date')
+            r_df = df_rrp.copy().rename(columns={'DATE': 'Date'}).set_index('Date')
 
-            a_df['DATE'] = pd.to_datetime(a_df['DATE']).dt.tz_localize(None).dt.normalize()
-            t_df['DATE'] = pd.to_datetime(t_df['DATE']).dt.tz_localize(None).dt.normalize()
-            r_df['DATE'] = pd.to_datetime(r_df['DATE']).dt.tz_localize(None).dt.normalize()
-
-            min_d = max(a_df['DATE'].min(), t_df['DATE'].min(), r_df['DATE'].min())
-            max_d = max(a_df['DATE'].max(), t_df['DATE'].max(), r_df['DATE'].max())
-            all_dates = pd.date_range(start=min_d, end=max_d, freq='D')
+            merged_liq = pd.concat([a_df['WALCL'], t_df['WTREGEN'], r_df['RRPONTSYD']], axis=1).sort_index().ffill().bfill()
             
-            full_df = pd.DataFrame({'DATE': all_dates})
-            full_df = pd.merge(full_df, a_df[['DATE', 'WALCL']], on='DATE', how='left').ffill().bfill()
-            full_df = pd.merge(full_df, t_df[['DATE', 'WTREGEN']], on='DATE', how='left').ffill().bfill()
-            full_df = pd.merge(full_df, r_df[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill().bfill()
-
-            if len(full_df) >= 28:
-                full_df['Net_Liquidity'] = (full_df['WALCL'] / 1000) - (full_df['WTREGEN'] / 1000) - full_df['RRPONTSYD']
-                current_net_liq = float(full_df['Net_Liquidity'].iloc[-1])
-                net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28])
+            if len(merged_liq) >= 28:
+                # WALCL(백만->십억), WTREGEN(백만->십억), RRP(십억)
+                merged_liq['Net_Liquidity'] = (merged_liq['WALCL'] / 1000) - (merged_liq['WTREGEN'] / 1000) - merged_liq['RRPONTSYD']
+                current_net_liq = float(merged_liq['Net_Liquidity'].iloc[-1])
+                net_liq_4w_ago = float(merged_liq['Net_Liquidity'].iloc[-28])
                 liq_change_4w = ((current_net_liq / net_liq_4w_ago) - 1) * 100
                 
-                latest_liq_date = a_df['DATE'].iloc[-1]
+                latest_liq_date = a_df.index[-1]
                 liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 최신 발표치 기준)"
 
                 if qqq_20d_ret > 0 and liq_change_4w < -2.0:
@@ -443,10 +438,10 @@ def calculate_ultra_risk_score():
                     liq_status = "🟢 양호"
 
                 try:
-                    q_df = pd.DataFrame({'Date': pd.to_datetime(qqq_close.index).tz_localize(None).normalize(), 'Close': qqq_close.values})
-                    merged_check = pd.merge_asof(q_df.sort_values('Date'), full_df.sort_values('DATE'), left_on='Date', right_on='DATE').dropna()
-                    if len(merged_check) >= 40:
-                        corr_val = merged_check['Close'].tail(40).corr(merged_check['Net_Liquidity'].tail(40))
+                    q_df = pd.DataFrame({'Close': qqq_close.values}, index=pd.to_datetime(qqq_close.index))
+                    chk = pd.merge_asof(q_df.sort_index(), merged_liq[['Net_Liquidity']].sort_index(), left_index=True, right_index=True).dropna()
+                    if len(chk) >= 40:
+                        corr_val = chk['Close'].tail(40).corr(chk['Net_Liquidity'].tail(40))
                         if not np.isnan(corr_val) and corr_val <= -0.65:
                             regime_alerts.append(f"연준 순유동성 vs QQQ 상관계수 역전 (Corr: {corr_val:.2f}) 👉 특수 대출/재정정책 유동성 왜곡 점검 필요")
                 except Exception:
@@ -587,7 +582,6 @@ def calculate_ultra_risk_score():
             "\n👉 <i>지표 간 구조적 괴리가 발생했으므로 가중치 보정 회의를 권장합니다.</i>\n────────────────\n"
         )
 
-    # 한국 표준시(KST) 적용된 기준 시각 문자열
     kst_now_str = get_kst_now().strftime('%Y-%m-%d %H:%M')
 
     report = (
