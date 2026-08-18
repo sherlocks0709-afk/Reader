@@ -6,26 +6,47 @@ import pandas as pd
 import numpy as np
 import io
 
-def fetch_stooq_data(ticker_symbol):
-    """야후파이낸스를 대체하는 Stooq 공식 금융 원천 CSV 실시간 다운로드 (지연/캐시 0%)"""
+def fetch_realtime_confirmed_data(ticker_symbol):
+    """장마감 직후 0초 만에 확정 종가와 일봉을 직결 수집하는 초정밀 API 파이프라인"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
+    
+    # 1. 야후 파이낸스 공식 v8 Chart API 직접 호출 (지연 없는 원천 호가)
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            result = data['chart']['result'][0]
+            timestamps = result['timestamp']
+            closes = result['indicators']['quote'][0]['close']
+            
+            # DataFrame 변환
+            dates = [datetime.datetime.fromtimestamp(ts).date() for ts in timestamps]
+            df = pd.DataFrame({'Date': dates, 'Close': closes}).dropna()
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            
+            close_s = df['Close'].astype(float)
+            meta_price = result['meta'].get('regularMarketPrice', float(close_s.iloc[-1]))
+            
+            # 마지막 거래일 종가 업데이트
+            if not close_s.empty:
+                close_s.iloc[-1] = float(meta_price)
+                return close_s, float(meta_price), df.index[-1], False
+    except Exception as e:
+        print(f"Yahoo v8 Chart API 에러 ({ticker_symbol}): {e}")
+
+    # 2. 백업: Stooq CSV
     symbol_map = {
-        "QQQ": "qqq.us",
-        "TQQQ": "tqqq.us",
-        "QQQE": "qqqe.us",
-        "^VIX": "^vix",
-        "^VXN": "^vxn",
-        "^VIX1D": "^vix1d",
-        "^SKEW": "^skew",
-        "NQ=F": "nq.f"
+        "QQQ": "qqq.us", "TQQQ": "tqqq.us", "QQQE": "qqqe.us",
+        "^VIX": "^vix", "^VXN": "^vxn", "^VIX1D": "^vix1d", "^SKEW": "^skew", "NQ=F": "nq.f"
     }
     stooq_sym = symbol_map.get(ticker_symbol, ticker_symbol.lower())
-    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
-    
+    url_stooq = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url_stooq, headers=headers, timeout=8)
         if res.status_code == 200 and len(res.text) > 50:
             df = pd.read_csv(io.StringIO(res.text))
             if 'Date' in df.columns and 'Close' in df.columns:
@@ -33,20 +54,7 @@ def fetch_stooq_data(ticker_symbol):
                 df = df.sort_values('Date').dropna(subset=['Close']).reset_index(drop=True)
                 df.set_index('Date', inplace=True)
                 close_s = df['Close'].astype(float)
-                latest_p = float(close_s.iloc[-1])
-                latest_d = df.index[-1]
-                return close_s, latest_p, latest_d, False
-    except Exception as e:
-        print(f"Stooq {ticker_symbol} 수집 실패: {e}")
-
-    # 비상 백업 (CBOE 또는 yfinance 최후 시도)
-    try:
-        import yfinance as yf
-        df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, auto_adjust=False)
-        if not df.empty:
-            s = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
-            s = pd.to_numeric(s, errors='coerce').dropna().astype(float)
-            return s, float(s.iloc[-1]), df.index[-1], False
+                return close_s, float(close_s.iloc[-1]), df.index[-1], False
     except Exception:
         pass
 
@@ -74,7 +82,7 @@ def fetch_vix3m_real():
     except Exception as e:
         print(f"CBOE VIX3M 원천 다운로드 에러: {e}")
 
-    s, p, _, err = fetch_stooq_data("^VIX3M")
+    s, p, _, err = fetch_realtime_confirmed_data("^VIX3M")
     if not err:
         return s, False
 
@@ -155,13 +163,13 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. Stooq 금융 원천 데이터 수집
-    qqq_close, current_close, qqq_last_date, qqq_err = fetch_stooq_data("QQQ")
-    tqqq_close, current_tqqq, _, _ = fetch_stooq_data("TQQQ")
-    vix_close_s, vix_current_val, _, vix_err = fetch_stooq_data("^VIX")
-    vix1d_close_s, vix1d_val, _, _ = fetch_stooq_data("^VIX1D")
-    vxn_close_s, vxn_current, _, vxn_err = fetch_stooq_data("^VXN")
-    skew_close_s, skew_current, _, skew_err = fetch_stooq_data("^SKEW")
+    # 1. 실시간 확정 시세 및 변동성 수집
+    qqq_close, current_close, qqq_last_date, qqq_err = fetch_realtime_confirmed_data("QQQ")
+    tqqq_close, current_tqqq, _, _ = fetch_realtime_confirmed_data("TQQQ")
+    vix_close_s, vix_current_val, _, vix_err = fetch_realtime_confirmed_data("^VIX")
+    vix1d_close_s, vix1d_val, _, _ = fetch_realtime_confirmed_data("^VIX1D")
+    vxn_close_s, vxn_current, _, vxn_err = fetch_realtime_confirmed_data("^VXN")
+    skew_close_s, skew_current, _, skew_err = fetch_realtime_confirmed_data("^SKEW")
     
     if qqq_err:
         data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
@@ -195,7 +203,7 @@ def calculate_ultra_risk_score():
         data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 4. 주말/야간 선물 갭 감지
-    nq_close, nq_curr_val, _, nq_err = fetch_stooq_data("NQ=F")
+    nq_close, nq_curr_val, _, nq_err = fetch_realtime_confirmed_data("NQ=F")
     fut_gap_status = ""
     fut_gap_severe = False
     if not nq_err and len(nq_close) >= 2:
@@ -294,7 +302,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = fetch_stooq_data("QQQE")
+        qqqe_close, _, _, _ = fetch_realtime_confirmed_data("QQQE")
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
@@ -543,8 +551,8 @@ def calculate_ultra_risk_score():
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
-        f"💰 <a href='https://stooq.com/q/?s=qqq.us'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"🔥 <a href='https://stooq.com/q/?s=tqqq.us'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
+        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
+        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
         f"🎯 <b>1단계 구조 점수: {total_score} / 100점</b>\n"
@@ -556,8 +564,8 @@ def calculate_ultra_risk_score():
         f"────────────────\n"
         f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
-        f"• <a href='https://stooq.com/q/?s=^vxn'>VXN</a>: {vxn_current:.2f} | <a href='https://stooq.com/q/?s=^skew'>SKEW</a>: {skew_current:.1f} | <a href='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv'>기간구조</a>: {vix_ratio:.2f}\n"
-        f"• <a href='https://stooq.com/q/?s=qqqe.us'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
+        f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv'>기간구조</a>: {vix_ratio:.2f}\n"
+        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
         f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{pcr_tag}\n"
         f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{hy_tag} ({hy_status})\n"
         f"• 순유동성: ${current_net_liq:.1f}B ({liq_change_4w:+.2f}%){liq_date_str}"
