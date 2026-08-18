@@ -7,27 +7,59 @@ import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
 
+DB_FILE = "history_db.csv"
+
 def get_kst_now():
-    """한국 표준시(KST, Asia/Seoul) 정확한 현재 시각 반환"""
+    """한국 표준시(KST) 현재 시각"""
     return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
 
 def get_last_us_trading_date():
     """서머타임 자동 적용 뉴욕 거래소 기준 직전 정규 거래일 날짜 산출"""
     ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
-    
-    # 미국 현지 16:00 정규장 마감 이전이면 전일이 기준, 이후면 당일이 기준
     if ny_now.hour < 16:
         d = ny_now.date() - datetime.timedelta(days=1)
     else:
         d = ny_now.date()
-        
-    # 주말 보정 (토=5, 일=6)
     while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d
 
+def update_and_verify_local_db(date_str, qqq_p, tqqq_p, vxn_p, skew_p, score_val):
+    """[자체 DB 엔진] CSV에 매일 기록하고 과거 데이터 무결성을 대조 검증"""
+    warnings = []
+    
+    if os.path.exists(DB_FILE):
+        try:
+            db_df = pd.read_csv(DB_FILE)
+            db_df['Date'] = db_df['Date'].astype(str)
+        except Exception:
+            db_df = pd.DataFrame(columns=['Date', 'QQQ', 'TQQQ', 'VXN', 'SKEW', 'Score'])
+    else:
+        db_df = pd.DataFrame(columns=['Date', 'QQQ', 'TQQQ', 'VXN', 'SKEW', 'Score'])
+
+    # 1. 과거 동일 날짜 데이터와의 불일치(변조/오염) 검증
+    if date_str in db_df['Date'].values:
+        past_row = db_df[db_df['Date'] == date_str].iloc[-1]
+        if abs(float(past_row['QQQ']) - qqq_p) > 0.05:
+            warnings.append(f"🚨 [DB 대조 불일치] {date_str} 저장 종가(${past_row['QQQ']}) vs 수집 종가(${qqq_p:.2f})")
+    else:
+        # 새로운 날짜 데이터 누적
+        new_row = pd.DataFrame([{
+            'Date': date_str,
+            'QQQ': round(qqq_p, 2),
+            'TQQQ': round(tqqq_p, 2),
+            'VXN': round(vxn_p, 2),
+            'SKEW': round(skew_p, 2),
+            'Score': round(score_val, 1)
+        }])
+        db_df = pd.concat([db_df, new_row], ignore_index=True)
+        db_df.drop_duplicates(subset=['Date'], keep='last', inplace=True)
+        db_df.sort_values('Date', inplace=True)
+        db_df.to_csv(DB_FILE, index=False)
+
+    return warnings, len(db_df)
+
 def fetch_yahoo_v8_chart(ticker_symbol):
-    """야후 v8 공식 Chart API에서 뉴욕 로컬 타임존 기준으로 캔들/종가 수집"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
     try:
@@ -38,7 +70,6 @@ def fetch_yahoo_v8_chart(ticker_symbol):
             timestamps = result['timestamp']
             closes = result['indicators']['quote'][0]['close']
             
-            # 뉴욕 로컬 타임존 기준 날짜 변환 (서머타임 자동 대응)
             ny_tz = ZoneInfo("America/New_York")
             dates = [datetime.datetime.fromtimestamp(ts, tz=ny_tz).date() for ts in timestamps]
             
@@ -56,7 +87,6 @@ def fetch_yahoo_v8_chart(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_stooq_csv(ticker_symbol):
-    """Stooq 공식 금융 거래소 원천 CSV 수집"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     symbol_map = {
         "QQQ": "qqq", "TQQQ": "tqqq", "QQQE": "qqqe",
@@ -79,7 +109,6 @@ def fetch_stooq_csv(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
-    """다중 소스 교차 검증 및 날짜 무결성 판정"""
     warning_msg = None
     s_y, p_y, d_y, err_y = fetch_yahoo_v8_chart(ticker_symbol)
     s_s, p_s, d_s, err_s = fetch_stooq_csv(ticker_symbol)
@@ -102,7 +131,6 @@ def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
     return chosen_s, chosen_p, chosen_d, warning_msg
 
 def fetch_vix3m_real():
-    """CBOE 공식 CDN에서 VIX3M 실제 원천 CSV 파싱"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
@@ -130,7 +158,6 @@ def fetch_vix3m_real():
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API 및 원천 CSV 2중 수집"""
     if api_key:
         try:
             url = "https://api.stlouisfed.org/fred/series/observations"
@@ -178,7 +205,6 @@ def fetch_fred_api(series_id, api_key):
     return None, None, True
 
 def fetch_equity_pcr():
-    """CBOE 공식 웹/CSV에서 순수 Equity Put/Call Ratio 추출"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url = "https://www.cboe.com/us/options/market_statistics/daily/"
@@ -347,7 +373,7 @@ def calculate_ultra_risk_score():
     score_term = float(np.clip((vix_ratio - 0.80) * (10 / 0.20), 0, 10))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 4: QQQ vs QQQE 쏠림 (결측치 정합성 안전 매칭)
+    # 지표 4: QQQ vs QQQE 쏠림
     score_breadth = 0.0
     breadth_divergence = 0.0
     z_breadth = 0.0
@@ -402,7 +428,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 지표 7: 순유동성 (정밀 시계열 병합 및 안전 연산)
+    # 지표 7: 순유동성
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -418,7 +444,6 @@ def calculate_ultra_risk_score():
             merged_liq = pd.concat([a_df['WALCL'], t_df['WTREGEN'], r_df['RRPONTSYD']], axis=1).sort_index().ffill().bfill()
             
             if len(merged_liq) >= 28:
-                # WALCL(백만->십억), WTREGEN(백만->십억), RRP(십억)
                 merged_liq['Net_Liquidity'] = (merged_liq['WALCL'] / 1000) - (merged_liq['WTREGEN'] / 1000) - merged_liq['RRPONTSYD']
                 current_net_liq = float(merged_liq['Net_Liquidity'].iloc[-1])
                 net_liq_4w_ago = float(merged_liq['Net_Liquidity'].iloc[-28])
@@ -457,6 +482,13 @@ def calculate_ultra_risk_score():
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
     total_score = round(sum(clean_scores), 1)
+
+    # 자체 로컬 DB 누적 및 무결성 대조 검증
+    db_warnings, db_total_days = update_and_verify_local_db(
+        str(qqq_d), current_close, current_tqqq, vxn_current, skew_current, total_score
+    )
+    if db_warnings:
+        data_warnings.extend(db_warnings)
 
     # MACD 연산
     ema12 = qqq_close.ewm(span=12, adjust=False).mean()
@@ -586,7 +618,7 @@ def calculate_ultra_risk_score():
 
     report = (
         f"📊 <b>[QQQ & TQQQ 듀얼 전략 정밀 판독기]</b>\n"
-        f"📅 기준(KST): {kst_now_str}\n\n"
+        f"📅 기준(KST): {kst_now_str} (자체DB: {db_total_days}일 누적)\n\n"
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
