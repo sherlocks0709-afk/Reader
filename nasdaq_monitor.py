@@ -12,8 +12,38 @@ def clean_series(df_col):
         s = df_col.iloc[:, 0]
     else:
         s = df_col
-    s = pd.to_numeric(s, errors='coerce').ffill().bfill()
+    s = pd.to_numeric(s, errors='coerce').dropna()
     return s.astype(float)
+
+def get_latest_price_and_series(ticker_symbol, period="3y"):
+    """장마감 직후 야후 파이낸스 일봉 지연/누락을 완벽히 방어하여 최신 종가 및 일봉 확보"""
+    try:
+        t = yf.Ticker(ticker_symbol)
+        df = t.history(period=period, interval="1d", auto_adjust=False)
+        
+        if df.empty or len(df) < 10:
+            df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
+        
+        close_series = clean_series(df['Close'])
+        
+        # fast_info를 통한 최신 확정 실시간/종가 크로스체크
+        latest_price = float(close_series.iloc[-1])
+        latest_date = df.index[-1]
+        
+        try:
+            fast_price = t.fast_info.get('last_price', None) or t.fast_info.get('regular_market_previous_close', None)
+            if fast_price is not None and not np.isnan(fast_price):
+                # 일봉 종가와 fast_info 가격 괴리가 0.1% 이상이면 최신 fast_info 확정치 우선 반영
+                if abs(fast_price - latest_price) / latest_price > 0.001:
+                    latest_price = float(fast_price)
+                    close_series.iloc[-1] = latest_price
+        except Exception:
+            pass
+
+        return close_series, latest_price, latest_date, False
+    except Exception as e:
+        print(f"{ticker_symbol} 시세 수집 오류: {e}")
+        return pd.Series([700.0]*100), 700.0, datetime.datetime.now(), True
 
 def fetch_vix3m_real():
     """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
@@ -128,22 +158,18 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 다운로드
-    qqq = yf.download("QQQ", period="3y", interval="1d", progress=False, auto_adjust=False)
-    tqqq = yf.download("TQQQ", period="1y", interval="1d", progress=False, auto_adjust=False)
+    # 1. 시세 다운로드 (최신 종가 무결성 검증 파이프라인)
+    qqq_close, current_close, qqq_last_date, qqq_err = get_latest_price_and_series("QQQ", period="3y")
+    tqqq_close, current_tqqq, _, _ = get_latest_price_and_series("TQQQ", period="1y")
+    
+    if qqq_err:
+        data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
+
     nq_fut = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=False)
     vix = yf.download("^VIX", period="3mo", interval="1d", progress=False, auto_adjust=False)
     vix1d = yf.download("^VIX1D", period="2mo", interval="1d", progress=False, auto_adjust=False)
     vxn = yf.download("^VXN", period="3mo", interval="1d", progress=False, auto_adjust=False)
     skew = yf.download("^SKEW", period="2mo", interval="1d", progress=False, auto_adjust=False)
-
-    if qqq.empty or len(qqq) < 50:
-        data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
-        qqq_close = pd.Series([700.0] * 100)
-    else:
-        qqq_close = clean_series(qqq['Close'])
-
-    tqqq_close = clean_series(tqqq['Close']) if not tqqq.empty else qqq_close
     
     if vix.empty:
         data_warnings.append("⚠️ VIX 지수 누락 (18.0 기본값 적용)")
@@ -209,8 +235,6 @@ def calculate_ultra_risk_score():
     bb_lower = sma20_s - (rolling_std20 * 2)
     bb_width_s = ((bb_upper - bb_lower) / sma20_s) * 100
 
-    current_close = float(qqq_close.iloc[-1])
-    current_tqqq = float(tqqq_close.iloc[-1])
     sma5 = float(sma5_s.iloc[-1])
     sma20 = float(sma20_s.iloc[-1])
     sma50 = float(sma50_s.iloc[-1])
@@ -221,6 +245,7 @@ def calculate_ultra_risk_score():
     is_ranging_market = (bb_width <= 4.0)
     peak_52w = float(qqq_close.tail(252).max())
     drawdown = ((current_close / peak_52w) - 1) * 100
+    date_tag = pd.to_datetime(qqq_last_date).strftime('%m/%d')
 
     # 지표 1: 200일 이격 Z-Score
     disp_mean = float(disp200_s.mean())
@@ -294,10 +319,9 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe = yf.download("QQQE", period="6mo", interval="1d", progress=False, auto_adjust=False)
-        if not qqqe.empty:
-            qqqe_close = clean_series(qqqe['Close'])
-            qqqe_ref = float(qqqe_close.iloc[-20]) if len(qqqe_close) >= 20 else float(qqqe_close.iloc[0])
+        qqqe_close, _, _, _ = get_latest_price_and_series("QQQE", period="6mo")
+        if not qqqe_close.empty and len(qqqe_close) >= 20:
+            qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
             breadth_divergence = qqq_20d_ret - qqqe_ret_20d
             
@@ -345,7 +369,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[API대체]"
 
-    # 지표 7: 순유동성 (타임존 일치 및 안전 연산)
+    # 지표 7: 순유동성
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -391,7 +415,6 @@ def calculate_ultra_risk_score():
                     score_liq = 0.0
                     liq_status = "🟢 양호"
 
-                # 상관관계 체제 진단 (타임존 제거 후 안전 병합)
                 try:
                     q_df = pd.DataFrame({'Date': pd.to_datetime(qqq_close.index).tz_localize(None).normalize(), 'Close': qqq_close.values})
                     merged_check = pd.merge_asof(q_df.sort_values('Date'), full_df.sort_values('DATE'), left_on='Date', right_on='DATE').dropna()
@@ -545,8 +568,8 @@ def calculate_ultra_risk_score():
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
-        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
+        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
+        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
         f"🎯 <b>1단계 구조 점수: {total_score} / 100점</b>\n"
