@@ -15,28 +15,20 @@ def clean_series(df_col):
     s = pd.to_numeric(s, errors='coerce').dropna()
     return s.astype(float)
 
-def get_latest_price_and_series(ticker_symbol, period="3y"):
-    """장마감 직후 야후 파이낸스 일봉 지연/고정 문제를 방어하여 최신 확정 수치 확보"""
+def get_exact_daily_data(ticker_symbol, period="3y"):
+    """캐싱 오류 없는 순수 일봉 데이터 및 최종 확정 종가 추출 (fast_info 왜곡 제거)"""
     try:
-        t = yf.Ticker(ticker_symbol)
-        df = t.history(period=period, interval="1d", auto_adjust=False)
-        
+        # download 방식으로 일봉 수집
+        df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
         if df.empty or len(df) < 5:
-            df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
-        
+            # history 백업 시도
+            t = yf.Ticker(ticker_symbol)
+            df = t.history(period=period, interval="1d", auto_adjust=False)
+            
         close_series = clean_series(df['Close'])
         latest_price = float(close_series.iloc[-1])
         latest_date = df.index[-1]
         
-        try:
-            fast_price = t.fast_info.get('last_price', None) or t.fast_info.get('regular_market_previous_close', None)
-            if fast_price is not None and not np.isnan(fast_price):
-                if abs(fast_price - latest_price) / (latest_price if latest_price != 0 else 1) > 0.0005:
-                    latest_price = float(fast_price)
-                    close_series.iloc[-1] = latest_price
-        except Exception:
-            pass
-
         return close_series, latest_price, latest_date, False
     except Exception as e:
         print(f"{ticker_symbol} 시세 수집 오류: {e}")
@@ -45,14 +37,14 @@ def get_latest_price_and_series(ticker_symbol, period="3y"):
 def fetch_vix3m_real():
     """야후 파이낸스 실패 시 CBOE 공식 CDN에서 VIX3M 실제 데이터를 직접 파싱하여 100% 정밀도 보장"""
     try:
-        s, p, _, err = get_latest_price_and_series("^VIX3M", period="3mo")
+        s, p, _, err = get_exact_daily_data("^VIX3M", period="3mo")
         if not err and len(s) >= 5:
             return s, False
     except Exception:
         pass
 
     try:
-        s, p, _, err = get_latest_price_and_series("^VXV", period="3mo")
+        s, p, _, err = get_exact_daily_data("^VXV", period="3mo")
         if not err and len(s) >= 5:
             return s, False
     except Exception:
@@ -155,13 +147,13 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 및 변동성 지표 전수 실시간 수집 파이프라인
-    qqq_close, current_close, qqq_last_date, qqq_err = get_latest_price_and_series("QQQ", period="3y")
-    tqqq_close, current_tqqq, _, _ = get_latest_price_and_series("TQQQ", period="1y")
-    vix_close_s, vix_current_val, _, vix_err = get_latest_price_and_series("^VIX", period="3mo")
-    vix1d_close_s, vix1d_val, _, _ = get_latest_price_and_series("^VIX1D", period="2mo")
-    vxn_close_s, vxn_current, _, vxn_err = get_latest_price_and_series("^VXN", period="3mo")
-    skew_close_s, skew_current, _, skew_err = get_latest_price_and_series("^SKEW", period="2mo")
+    # 1. 시세 및 변동성 지표 전수 수집
+    qqq_close, current_close, qqq_last_date, qqq_err = get_exact_daily_data("QQQ", period="3y")
+    tqqq_close, current_tqqq, _, _ = get_exact_daily_data("TQQQ", period="1y")
+    vix_close_s, vix_current_val, _, vix_err = get_exact_daily_data("^VIX", period="3mo")
+    vix1d_close_s, vix1d_val, _, _ = get_exact_daily_data("^VIX1D", period="2mo")
+    vxn_close_s, vxn_current, _, vxn_err = get_exact_daily_data("^VXN", period="3mo")
+    skew_close_s, skew_current, _, skew_err = get_exact_daily_data("^SKEW", period="2mo")
     
     if qqq_err:
         data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
@@ -195,7 +187,7 @@ def calculate_ultra_risk_score():
         data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 4. 주말/야간 선물 갭 감지
-    nq_close, nq_curr_val, _, nq_err = get_latest_price_and_series("NQ=F", period="5d")
+    nq_close, nq_curr_val, _, nq_err = get_exact_daily_data("NQ=F", period="5d")
     fut_gap_status = ""
     fut_gap_severe = False
     if not nq_err and len(nq_close) >= 2:
@@ -296,7 +288,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = get_latest_price_and_series("QQQE", period="6mo")
+        qqqe_close, _, _, _ = get_exact_daily_data("QQQE", period="6mo")
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
