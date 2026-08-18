@@ -6,19 +6,20 @@ import pandas as pd
 import numpy as np
 import io
 
+def get_kst_now():
+    """UTC 서버 환경에서 무조건 한국 표준시(KST, UTC+9) 반환"""
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+
 def get_last_us_trading_date():
     """뉴욕 거래소 로컬 시간 기준 직전 정규 거래일 날짜 산출"""
-    # UTC 기준 현재 시각에서 뉴욕 오프셋(UTC-4) 적용
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     ny_now = now_utc - datetime.timedelta(hours=4)
     
-    # 미국 현지 16:00 장마감 이전이면 전일이 기준, 장마감 이후면 당일이 기준
     if ny_now.hour < 16:
         d = ny_now.date() - datetime.timedelta(days=1)
     else:
         d = ny_now.date()
         
-    # 주말 보정
     while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d
@@ -35,7 +36,6 @@ def fetch_yahoo_v8_chart(ticker_symbol):
             timestamps = result['timestamp']
             closes = result['indicators']['quote'][0]['close']
             
-            # 뉴욕 거래소 로컬 날짜 기준(UTC-4)으로 변환하여 날짜 밀림 차단
             dates = [(datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) - datetime.timedelta(hours=4)).date() for ts in timestamps]
             df = pd.DataFrame({'Date': dates, 'Close': closes}).dropna()
             df['Date'] = pd.to_datetime(df['Date'])
@@ -51,7 +51,7 @@ def fetch_yahoo_v8_chart(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_stooq_csv(ticker_symbol):
-    """Stooq 공식 금융 거래소 원천 CSV 수집 (정확한 티커 심볼 매핑)"""
+    """Stooq 공식 금융 거래소 원천 CSV 수집"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     symbol_map = {
         "QQQ": "qqq", "TQQQ": "tqqq", "QQQE": "qqqe",
@@ -76,7 +76,6 @@ def fetch_stooq_csv(ticker_symbol):
 def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
     """다중 소스 교차 검증 및 날짜 무결성 판정"""
     warning_msg = None
-    
     s_y, p_y, d_y, err_y = fetch_yahoo_v8_chart(ticker_symbol)
     s_s, p_s, d_s, err_s = fetch_stooq_csv(ticker_symbol)
     
@@ -126,7 +125,7 @@ def fetch_vix3m_real():
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API 및 원천 CSV 2중 수집 (최신 발표치 전진 보정)"""
+    """FRED 공식 REST API에서 최신 데이터 역순 수집 후 정렬"""
     if api_key:
         try:
             url = "https://api.stlouisfed.org/fred/series/observations"
@@ -134,8 +133,8 @@ def fetch_fred_api(series_id, api_key):
                 "series_id": series_id,
                 "api_key": api_key.strip(),
                 "file_type": "json",
-                "sort_order": "asc",
-                "limit": 1000
+                "sort_order": "desc",
+                "limit": 100
             }
             res = requests.get(url, params=params, timeout=10)
             data = res.json()
@@ -152,8 +151,8 @@ def fetch_fred_api(series_id, api_key):
                     df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
                     last_date = df["DATE"].iloc[-1]
                     return df, last_date, False
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"FRED API 에러 ({series_id}): {e}")
 
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -229,7 +228,7 @@ def calculate_ultra_risk_score():
     if w_vxn: data_warnings.append(w_vxn)
     if w_skew: data_warnings.append(w_skew)
 
-    # 2. VIX3M 수집 (CBOE 원천)
+    # 2. VIX3M 수집
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
     if vix3m_failed or vix3m_close_s is None:
         data_warnings.append("⚠️ VIX3M 3개월물 공식 데이터 수신 실패")
@@ -248,7 +247,7 @@ def calculate_ultra_risk_score():
     if walcl_err or tga_err or rrp_err:
         data_warnings.append("⚠️ FRED 순유동성 데이터 수신 오류")
 
-    # 4. 주말/야간 선물 갭 감지
+    # 4. 선물 갭 감지
     nq_close, nq_curr_val, _, _ = fetch_cross_validated_data("NQ=F", expected_trading_date)
     fut_gap_status = ""
     fut_gap_severe = False
@@ -398,7 +397,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 지표 7: 순유동성 (주간 연준 자산 최신 발표치 반영)
+    # 지표 7: 순유동성
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -425,7 +424,6 @@ def calculate_ultra_risk_score():
             full_df = pd.merge(full_df, r_df[['DATE', 'RRPONTSYD']], on='DATE', how='left').ffill().bfill()
 
             if len(full_df) >= 28:
-                # WALCL(백만달러->십억달러), WTREGEN(백만달러->십억달러), RRP(십억달러)
                 full_df['Net_Liquidity'] = (full_df['WALCL'] / 1000) - (full_df['WTREGEN'] / 1000) - full_df['RRPONTSYD']
                 current_net_liq = float(full_df['Net_Liquidity'].iloc[-1])
                 net_liq_4w_ago = float(full_df['Net_Liquidity'].iloc[-28])
@@ -478,7 +476,7 @@ def calculate_ultra_risk_score():
 
     is_macro_headwind = (liq_change_4w < -1.0) or (hy_current >= 4.0)
 
-    # QQQ 1배수 지침 매핑
+    # QQQ 1배수 지침
     if total_score >= 80:
         if below_sma5 or macd_deadcross:
             qqq_action = "🚨 <b>[확률 95% 대세 고점 격발]</b> 👉 추가 50% 매도 (총 현금 비중 80~100% 확보)"
@@ -501,7 +499,7 @@ def calculate_ultra_risk_score():
     else:
         qqq_action = "🟢 <b>[안정 국면]</b> 👉 주식 비중 100% 유지"
 
-    # TQQQ 3배수 기관급 지침 매핑
+    # TQQQ 3배수 지침
     if fut_gap_severe:
         tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> NQ선물 -1.5% 이상 급락! 👉 <b>프리마켓/시초가 TQQQ 30% 선제 축소</b> (슬리피지 방어)"
     elif total_score >= 80:
@@ -526,7 +524,7 @@ def calculate_ultra_risk_score():
     else:
         tqqq_action = "🟢 <b>[TQQQ 안정 국면]</b> 👉 TQQQ 100% 포지션 유지"
 
-    # 바닥 탐색 모드 (-10% 하락 시)
+    # 바닥 탐색 모드
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
@@ -577,12 +575,10 @@ def calculate_ultra_risk_score():
             f"📙 <b>[TQQQ 3배수 기관급 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
 
-    # 1. 데이터 품질 경보 배너
     warning_banner = ""
     if data_warnings:
         warning_banner = "🚨 <b>[데이터 품질/수집 경보]</b>\n" + "\n".join([f"• {w}" for w in data_warnings]) + "\n────────────────\n"
 
-    # 2. 체제 변화 배너
     regime_banner = ""
     if regime_alerts:
         regime_banner = (
@@ -591,9 +587,12 @@ def calculate_ultra_risk_score():
             "\n👉 <i>지표 간 구조적 괴리가 발생했으므로 가중치 보정 회의를 권장합니다.</i>\n────────────────\n"
         )
 
+    # 한국 표준시(KST) 적용된 기준 시각 문자열
+    kst_now_str = get_kst_now().strftime('%Y-%m-%d %H:%M')
+
     report = (
         f"📊 <b>[QQQ & TQQQ 듀얼 전략 정밀 판독기]</b>\n"
-        f"📅 기준: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"📅 기준(KST): {kst_now_str}\n\n"
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
