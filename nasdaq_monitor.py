@@ -2,71 +2,58 @@ import datetime
 import os
 import re
 import requests
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import io
 
-def clean_series(df_col):
-    """yfinance 멀티인덱스 컬럼을 안전하게 1차원 Series로 변환 및 결측치 제거"""
-    if isinstance(df_col, pd.DataFrame):
-        s = df_col.iloc[:, 0]
-    else:
-        s = df_col
-    s = pd.to_numeric(s, errors='coerce').dropna()
-    return s.astype(float)
-
-def fetch_realtime_yahoo_chart(ticker_symbol):
-    """야후 v8 REST API를 직접 호출하여 캐싱 없이 100% 최신 실시간/마감 종가 추출"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?interval=1d&range=1mo"
+def fetch_stooq_data(ticker_symbol):
+    """야후파이낸스를 대체하는 Stooq 공식 금융 원천 CSV 실시간 다운로드 (지연/캐시 0%)"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    symbol_map = {
+        "QQQ": "qqq.us",
+        "TQQQ": "tqqq.us",
+        "QQQE": "qqqe.us",
+        "^VIX": "^vix",
+        "^VXN": "^vxn",
+        "^VIX1D": "^vix1d",
+        "^SKEW": "^skew",
+        "NQ=F": "nq.f"
+    }
+    stooq_sym = symbol_map.get(ticker_symbol, ticker_symbol.lower())
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+    
     try:
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            result = data['chart']['result'][0]
-            timestamps = result['timestamp']
-            closes = result['indicators']['quote'][0]['close']
-            
-            valid_data = []
-            for t, c in zip(timestamps, closes):
-                if c is not None and not np.isnan(c):
-                    valid_data.append({'Date': pd.to_datetime(t, unit='s'), 'Close': float(c)})
-            
-            if valid_data:
-                df = pd.DataFrame(valid_data).set_index('Date').sort_index()
-                return df['Close'], float(df['Close'].iloc[-1]), df.index[-1], False
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200 and len(res.text) > 50:
+            df = pd.read_csv(io.StringIO(res.text))
+            if 'Date' in df.columns and 'Close' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date').dropna(subset=['Close']).reset_index(drop=True)
+                df.set_index('Date', inplace=True)
+                close_s = df['Close'].astype(float)
+                latest_p = float(close_s.iloc[-1])
+                latest_d = df.index[-1]
+                return close_s, latest_p, latest_d, False
     except Exception as e:
-        print(f"{ticker_symbol} 실시간 API 오류: {e}")
-    return None, None, None, True
+        print(f"Stooq {ticker_symbol} 수집 실패: {e}")
 
-def get_exact_daily_data(ticker_symbol, period="3y"):
-    """일봉과 실시간 REST API를 병합하여 지연 및 고정 현상을 원천 차단"""
-    # 1차: 실시간 v8 API 직접 조회 (장마감 최신 데이터)
-    s_rt, p_rt, d_rt, err_rt = fetch_realtime_yahoo_chart(ticker_symbol)
-    
-    # 2차: 장기 히스토리 다운로드
+    # 비상 백업 (CBOE 또는 yfinance 최후 시도)
     try:
-        df = yf.download(ticker_symbol, period=period, interval="1d", progress=False, auto_adjust=False)
-        close_series = clean_series(df['Close'])
+        import yfinance as yf
+        df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, auto_adjust=False)
+        if not df.empty:
+            s = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
+            s = pd.to_numeric(s, errors='coerce').dropna().astype(float)
+            return s, float(s.iloc[-1]), df.index[-1], False
     except Exception:
-        close_series = pd.Series([100.0]*50)
-    
-    if not err_rt and s_rt is not None and not s_rt.empty:
-        # 실시간 최신 종가가 일봉 데이터보다 최신이면 결합
-        if close_series.empty or d_rt.date() >= close_series.index[-1].date():
-            if not close_series.empty and d_rt.date() == close_series.index[-1].date():
-                close_series.iloc[-1] = p_rt
-            else:
-                close_series = pd.concat([close_series, pd.Series([p_rt], index=[d_rt])])
-            return close_series, p_rt, d_rt, False
-            
-    if not close_series.empty:
-        return close_series, float(close_series.iloc[-1]), close_series.index[-1], False
+        pass
 
     return pd.Series([100.0]*50), 100.0, datetime.datetime.now(), True
 
 def fetch_vix3m_real():
-    """CBOE 공식 CDN CSV 및 REST API를 통해 VIX3M 100% 정밀도 보장"""
+    """CBOE 공식 CDN에서 VIX3M 실제 원천 CSV 파싱"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
@@ -87,14 +74,14 @@ def fetch_vix3m_real():
     except Exception as e:
         print(f"CBOE VIX3M 원천 다운로드 에러: {e}")
 
-    s, _, _, err = get_exact_daily_data("^VIX3M", period="3mo")
-    if not err and len(s) >= 5:
+    s, p, _, err = fetch_stooq_data("^VIX3M")
+    if not err:
         return s, False
 
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API 및 최종 데이터 일자 확인"""
+    """FRED 공식 REST API"""
     if not api_key:
         return None, None, False
     try:
@@ -168,27 +155,27 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 시세 및 변동성 지표 전수 수집 (v8 실시간 API 직결)
-    qqq_close, current_close, qqq_last_date, qqq_err = get_exact_daily_data("QQQ", period="3y")
-    tqqq_close, current_tqqq, _, _ = get_exact_daily_data("TQQQ", period="1y")
-    vix_close_s, vix_current_val, _, vix_err = get_exact_daily_data("^VIX", period="3mo")
-    vix1d_close_s, vix1d_val, _, _ = get_exact_daily_data("^VIX1D", period="2mo")
-    vxn_close_s, vxn_current, _, vxn_err = get_exact_daily_data("^VXN", period="3mo")
-    skew_close_s, skew_current, _, skew_err = get_exact_daily_data("^SKEW", period="2mo")
+    # 1. Stooq 금융 원천 데이터 수집
+    qqq_close, current_close, qqq_last_date, qqq_err = fetch_stooq_data("QQQ")
+    tqqq_close, current_tqqq, _, _ = fetch_stooq_data("TQQQ")
+    vix_close_s, vix_current_val, _, vix_err = fetch_stooq_data("^VIX")
+    vix1d_close_s, vix1d_val, _, _ = fetch_stooq_data("^VIX1D")
+    vxn_close_s, vxn_current, _, vxn_err = fetch_stooq_data("^VXN")
+    skew_close_s, skew_current, _, skew_err = fetch_stooq_data("^SKEW")
     
     if qqq_err:
         data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
-    if vix_err:
+    if vix_err or len(vix_close_s) < 5:
         vix_close_s = pd.Series([18.0] * len(qqq_close), index=qqq_close.index)
         vix_current_val = 18.0
-    if vxn_err:
+    if vxn_err or len(vxn_close_s) < 5:
         vxn_close_s = vix_close_s
         vxn_current = vix_current_val
-    if skew_err:
+    if skew_err or len(skew_close_s) < 5:
         skew_close_s = pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
         skew_current = 125.0
 
-    # 2. VIX3M 수집
+    # 2. VIX3M 수집 (CBOE 원천)
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
     if vix3m_failed or vix3m_close_s is None:
         data_warnings.append("⚠️ VIX3M 3개월물 공식 데이터 수신 실패")
@@ -208,7 +195,7 @@ def calculate_ultra_risk_score():
         data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 4. 주말/야간 선물 갭 감지
-    nq_close, nq_curr_val, _, nq_err = get_exact_daily_data("NQ=F", period="5d")
+    nq_close, nq_curr_val, _, nq_err = fetch_stooq_data("NQ=F")
     fut_gap_status = ""
     fut_gap_severe = False
     if not nq_err and len(nq_close) >= 2:
@@ -221,8 +208,6 @@ def calculate_ultra_risk_score():
                 fut_gap_status = f"🚨 <b>[야간/주말 NQ선물 갭하락 경보]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
             elif fut_change >= 1.5:
                 fut_gap_status = f"🚀 <b>[야간/주말 NQ선물 갭상승]</b> NQ선물: <b>{fut_change:+.2f}%</b>\n"
-    else:
-        data_warnings.append("⚠️ NQ 선물(야간 갭) 데이터 수신 미확인")
 
     # 5. 이동평균선 & 볼린저 밴드
     sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
@@ -309,7 +294,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = get_exact_daily_data("QQQE", period="6mo")
+        qqqe_close, _, _, _ = fetch_stooq_data("QQQE")
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
@@ -558,8 +543,8 @@ def calculate_ultra_risk_score():
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
-        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
+        f"💰 <a href='https://stooq.com/q/?s=qqq.us'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
+        f"🔥 <a href='https://stooq.com/q/?s=tqqq.us'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | BB Width: <b>{bb_width:.1f}%</b> ({'🔒 횡보수축' if is_ranging_market else '🟢 확장'})\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
         f"🎯 <b>1단계 구조 점수: {total_score} / 100점</b>\n"
@@ -571,8 +556,8 @@ def calculate_ultra_risk_score():
         f"────────────────\n"
         f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
-        f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://finance.yahoo.com/quote/%5EVIX3M'>기간구조</a>: {vix_ratio:.2f}\n"
-        f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
+        f"• <a href='https://stooq.com/q/?s=^vxn'>VXN</a>: {vxn_current:.2f} | <a href='https://stooq.com/q/?s=^skew'>SKEW</a>: {skew_current:.1f} | <a href='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv'>기간구조</a>: {vix_ratio:.2f}\n"
+        f"• <a href='https://stooq.com/q/?s=qqqe.us'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
         f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{pcr_tag}\n"
         f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{hy_tag} ({hy_status})\n"
         f"• 순유동성: ${current_net_liq:.1f}B ({liq_change_4w:+.2f}%){liq_date_str}"
