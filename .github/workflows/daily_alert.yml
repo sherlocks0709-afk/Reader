@@ -1,9 +1,9 @@
 name: Nasdaq QQQ Daily Ultra Monitor
 
 on:
-  schedule:
+  #schedule:
     # UTC 기준 22:13 (일~금) = 한국 시간(KST) 매일 오전 07:13 (월~토) 발송
-    - cron: '13 22 * * 0-5'
+    # - cron: '13 22 * * 0-5'
   workflow_dispatch:
 
 jobs:
