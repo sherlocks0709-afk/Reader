@@ -6,15 +6,29 @@ import pandas as pd
 import numpy as np
 import io
 
-def fetch_realtime_confirmed_data(ticker_symbol):
-    """장마감 직후 0초 만에 확정 종가와 일봉을 직결 수집하는 초정밀 API 파이프라인"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+def get_last_us_trading_date():
+    """뉴욕 거래소 기준 직전 완료된 정규 거래일 날짜 산출 (주말/공휴일 방어)"""
+    # 현재 UTC 기준 시간
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    # 뉴욕 시간 (UTC - 4, 서머타임 기준)
+    ny_now = now_utc - datetime.timedelta(hours=4)
     
-    # 1. 야후 파이낸스 공식 v8 Chart API 직접 호출 (지연 없는 원천 호가)
+    # 당일 장마감(미국 16:00) 전이면 전날이 기준, 장마감 후면 당일이 기준
+    if ny_now.hour < 16:
+        d = ny_now.date() - datetime.timedelta(days=1)
+    else:
+        d = ny_now.date()
+        
+    # 주말 보정
+    while d.weekday() >= 5:  # 5=토, 6=일
+        d -= datetime.timedelta(days=1)
+    return d
+
+def fetch_yahoo_v8_chart(ticker_symbol):
+    """야후 v8 공식 Chart API에서 캔들/확정 시세 수집"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
         res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
@@ -22,31 +36,31 @@ def fetch_realtime_confirmed_data(ticker_symbol):
             timestamps = result['timestamp']
             closes = result['indicators']['quote'][0]['close']
             
-            # DataFrame 변환
             dates = [datetime.datetime.fromtimestamp(ts).date() for ts in timestamps]
             df = pd.DataFrame({'Date': dates, 'Close': closes}).dropna()
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
-            
             close_s = df['Close'].astype(float)
-            meta_price = result['meta'].get('regularMarketPrice', float(close_s.iloc[-1]))
             
-            # 마지막 거래일 종가 업데이트
+            meta_p = result['meta'].get('regularMarketPrice', float(close_s.iloc[-1]))
             if not close_s.empty:
-                close_s.iloc[-1] = float(meta_price)
-                return close_s, float(meta_price), df.index[-1], False
+                close_s.iloc[-1] = float(meta_p)
+                return close_s, float(meta_p), df.index[-1].date(), False
     except Exception as e:
-        print(f"Yahoo v8 Chart API 에러 ({ticker_symbol}): {e}")
+        print(f"Yahoo v8 수집 실패 ({ticker_symbol}): {e}")
+    return None, 0.0, None, True
 
-    # 2. 백업: Stooq CSV
+def fetch_stooq_csv(ticker_symbol):
+    """Stooq 공식 금융 거래소 원천 CSV 수집"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
     symbol_map = {
         "QQQ": "qqq.us", "TQQQ": "tqqq.us", "QQQE": "qqqe.us",
         "^VIX": "^vix", "^VXN": "^vxn", "^VIX1D": "^vix1d", "^SKEW": "^skew", "NQ=F": "nq.f"
     }
     stooq_sym = symbol_map.get(ticker_symbol, ticker_symbol.lower())
-    url_stooq = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
     try:
-        res = requests.get(url_stooq, headers=headers, timeout=8)
+        res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200 and len(res.text) > 50:
             df = pd.read_csv(io.StringIO(res.text))
             if 'Date' in df.columns and 'Close' in df.columns:
@@ -54,11 +68,51 @@ def fetch_realtime_confirmed_data(ticker_symbol):
                 df = df.sort_values('Date').dropna(subset=['Close']).reset_index(drop=True)
                 df.set_index('Date', inplace=True)
                 close_s = df['Close'].astype(float)
-                return close_s, float(close_s.iloc[-1]), df.index[-1], False
-    except Exception:
-        pass
+                return close_s, float(close_s.iloc[-1]), df.index[-1].date(), False
+    except Exception as e:
+        print(f"Stooq 수집 실패 ({ticker_symbol}): {e}")
+    return None, 0.0, None, True
 
-    return pd.Series([100.0]*50), 100.0, datetime.datetime.now(), True
+def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
+    """[핵심 안전장치] 다중 소스 교차 검증 및 거래일 날짜 일치 판정"""
+    warning_msg = None
+    
+    # 1. 야후 v8 수집
+    s_y, p_y, d_y, err_y = fetch_yahoo_v8_chart(ticker_symbol)
+    # 2. Stooq 수집
+    s_s, p_s, d_s, err_s = fetch_stooq_csv(ticker_symbol)
+    
+    # 소스 둘 다 실패한 경우
+    if err_y and err_s:
+        return pd.Series([100.0]*50), 100.0, expected_trading_date, f"🚨 {ticker_symbol} 모든 원천 데이터 수집 실패"
+    
+    # 소스 하나만 성공한 경우
+    if err_s and not err_y:
+        chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
+        warning_msg = f"⚠️ {ticker_symbol} Stooq 백업 수집 실패 (야후 단일 의존)"
+    elif err_y and not err_s:
+        chosen_s, chosen_p, chosen_d = s_s, p_s, d_s
+        warning_msg = f"⚠️ {ticker_symbol} 야후 API 실패 (Stooq 단일 의존)"
+    else:
+        # 둘 다 성공한 경우 -> 교차 검증 (Cross-Check)
+        diff_pct = abs(p_y - p_s) / p_y * 100
+        if diff_pct > 0.3:  # 0.3% 이상 괴리 시 경보
+            warning_msg = f"🚨 {ticker_symbol} 소스 간 가격 괴리 ({diff_pct:.2f}%) 발생 [야후: ${p_y:.2f} vs Stooq: ${p_s:.2f}]"
+            # 최신 날짜 우선 채택
+            if d_y >= d_s:
+                chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
+            else:
+                chosen_s, chosen_p, chosen_d = s_s, p_s, d_s
+        else:
+            # 완전 일치
+            chosen_s, chosen_p, chosen_d = s_y, p_y, d_y
+
+    # 날짜 검증: 직전 미국 정규장 거래일과 데이터 날짜가 일치하는지 검사
+    if chosen_d < expected_trading_date:
+        date_warn = f"⚠️ {ticker_symbol} 데이터 지연 (기준일: {expected_trading_date.strftime('%m/%d')} / 수집일: {chosen_d.strftime('%m/%d')})"
+        warning_msg = (warning_msg + " | " + date_warn) if warning_msg else date_warn
+
+    return chosen_s, chosen_p, chosen_d, warning_msg
 
 def fetch_vix3m_real():
     """CBOE 공식 CDN에서 VIX3M 실제 원천 CSV 파싱"""
@@ -82,46 +136,63 @@ def fetch_vix3m_real():
     except Exception as e:
         print(f"CBOE VIX3M 원천 다운로드 에러: {e}")
 
-    s, p, _, err = fetch_realtime_confirmed_data("^VIX3M")
+    s, p, d, err = fetch_yahoo_v8_chart("^VIX3M")
     if not err:
         return s, False
 
     return None, True
 
 def fetch_fred_api(series_id, api_key):
-    """FRED 공식 REST API"""
-    if not api_key:
-        return None, None, False
-    try:
-        url = "https://api.stlouisfed.org/fred/series/observations"
-        params = {
-            "series_id": series_id,
-            "api_key": api_key,
-            "file_type": "json",
-            "sort_order": "desc",
-            "limit": 100
-        }
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
-        if "observations" not in data or not data["observations"]:
-            return None, None, False
+    """FRED 공식 REST API 및 웹 원천 CSV 2중 교차 수집"""
+    if api_key:
+        try:
+            url = "https://api.stlouisfed.org/fred/series/observations"
+            params = {
+                "series_id": series_id,
+                "api_key": api_key.strip(),
+                "file_type": "json",
+                "sort_order": "asc",
+                "limit": 1000
+            }
+            res = requests.get(url, params=params, timeout=10)
+            data = res.json()
+            if "observations" in data and data["observations"]:
+                records = []
+                for obs in data["observations"]:
+                    val = obs.get("value", ".")
+                    if val != ".":
+                        records.append({
+                            "DATE": pd.to_datetime(obs["date"]),
+                            series_id: float(val)
+                        })
+                if records:
+                    df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
+                    last_date = df["DATE"].iloc[-1]
+                    days_lag = (datetime.datetime.now() - last_date).days
+                    is_stale = (days_lag > 14)
+                    return df, last_date, is_stale
+        except Exception:
+            pass
 
-        records = []
-        for obs in data["observations"]:
-            val = obs.get("value", ".")
-            if val != ".":
-                records.append({
-                    "DATE": pd.to_datetime(obs["date"]),
-                    series_id: float(val)
-                })
-        df = pd.DataFrame(records).sort_values("DATE").reset_index(drop=True)
-        last_date = df["DATE"].iloc[-1]
-        days_lag = (datetime.datetime.now() - last_date).days
-        is_stale = (days_lag > 7)
-        return df, last_date, is_stale
-    except Exception as e:
-        print(f"FRED 에러 ({series_id}): {e}")
-        return None, None, False
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        res = requests.get(csv_url, headers=headers, timeout=10)
+        if res.status_code == 200 and len(res.text) > 30:
+            df = pd.read_csv(io.StringIO(res.text))
+            df.columns = [c.strip().upper() for c in df.columns]
+            if "DATE" in df.columns and series_id.upper() in df.columns:
+                df["DATE"] = pd.to_datetime(df["DATE"])
+                df[series_id] = pd.to_numeric(df[series_id.upper()], errors='coerce')
+                df = df.dropna(subset=[series_id]).sort_values("DATE").reset_index(drop=True)
+                last_date = df["DATE"].iloc[-1]
+                days_lag = (datetime.datetime.now() - last_date).days
+                is_stale = (days_lag > 14)
+                return df[['DATE', series_id]], last_date, is_stale
+    except Exception:
+        pass
+
+    return None, None, False
 
 def fetch_equity_pcr():
     """CBOE 공식 웹/CSV에서 순수 Equity Put/Call Ratio 추출"""
@@ -163,25 +234,29 @@ def calculate_ultra_risk_score():
     data_warnings = []
     regime_alerts = []
 
-    # 1. 실시간 확정 시세 및 변동성 수집
-    qqq_close, current_close, qqq_last_date, qqq_err = fetch_realtime_confirmed_data("QQQ")
-    tqqq_close, current_tqqq, _, _ = fetch_realtime_confirmed_data("TQQQ")
-    vix_close_s, vix_current_val, _, vix_err = fetch_realtime_confirmed_data("^VIX")
-    vix1d_close_s, vix1d_val, _, _ = fetch_realtime_confirmed_data("^VIX1D")
-    vxn_close_s, vxn_current, _, vxn_err = fetch_realtime_confirmed_data("^VXN")
-    skew_close_s, skew_current, _, skew_err = fetch_realtime_confirmed_data("^SKEW")
-    
-    if qqq_err:
-        data_warnings.append("⚠️ QQQ 가격 데이터 수신 실패")
-    if vix_err or len(vix_close_s) < 5:
-        vix_close_s = pd.Series([18.0] * len(qqq_close), index=qqq_close.index)
-        vix_current_val = 18.0
-    if vxn_err or len(vxn_close_s) < 5:
-        vxn_close_s = vix_close_s
-        vxn_current = vix_current_val
-    if skew_err or len(skew_close_s) < 5:
-        skew_close_s = pd.Series([125.0] * len(qqq_close), index=qqq_close.index)
-        skew_current = 125.0
+    expected_trading_date = get_last_us_trading_date()
+
+    # 1. 시세 및 변동성 4중 교차 검증 파이프라인
+    qqq_close, current_close, qqq_d, w_qqq = fetch_cross_validated_data("QQQ", expected_trading_date)
+    tqqq_close, current_tqqq, tqqq_d, w_tqqq = fetch_cross_validated_data("TQQQ", expected_trading_date)
+    vix_close_s, vix_current_val, vix_d, w_vix = fetch_cross_validated_data("^VIX", expected_trading_date)
+    vix1d_close_s, vix1d_val, _, _ = fetch_cross_validated_data("^VIX1D", expected_trading_date)
+    vxn_close_s, vxn_current, vxn_d, w_vxn = fetch_cross_validated_data("^VXN", expected_trading_date)
+    skew_close_s, skew_current, _, w_skew = fetch_cross_validated_data("^SKEW", expected_trading_date)
+
+    if w_qqq: data_warnings.append(w_qqq)
+    if w_tqqq: data_warnings.append(w_tqqq)
+    if w_vix: data_warnings.append(w_vix)
+    if w_vxn: data_warnings.append(w_vxn)
+    if w_skew: data_warnings.append(w_skew)
+
+    # 파생상품 물리적 정합성 검증 (QQQ vs TQQQ 등락률 3배수 체크)
+    if len(qqq_close) >= 2 and len(tqqq_close) >= 2:
+        qqq_chg = (current_close / float(qqq_close.iloc[-2]) - 1) * 100
+        tqqq_chg = (current_tqqq / float(tqqq_close.iloc[-2]) - 1) * 100
+        leverage_diff = abs(tqqq_chg - (qqq_chg * 3.0))
+        if leverage_diff > 2.0:  # 3배수 대비 괴리가 2.0%p 이상이면 경보
+            data_warnings.append(f"🚨 QQQ/TQQQ 등락률 괴리 ({leverage_diff:.1f}%p) 👉 시세 오염 가능성 확인 필요")
 
     # 2. VIX3M 수집 (CBOE 원천)
     vix3m_close_s, vix3m_failed = fetch_vix3m_real()
@@ -198,15 +273,15 @@ def calculate_ultra_risk_score():
     df_rrp, date_rrp, rrp_stale = fetch_fred_api("RRPONTSYD", fred_api_key)
 
     if df_hy is None or hy_stale:
-        data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류 또는 7일 이상 지연")
+        data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류 또는 지연")
     if df_assets is None or df_tga is None or df_rrp is None or walcl_stale:
         data_warnings.append("⚠️ FRED 순유동성(연준자산/TGA/RRP) 수신 오류 또는 지연")
 
     # 4. 주말/야간 선물 갭 감지
-    nq_close, nq_curr_val, _, nq_err = fetch_realtime_confirmed_data("NQ=F")
+    nq_close, nq_curr_val, _, _ = fetch_cross_validated_data("NQ=F", expected_trading_date)
     fut_gap_status = ""
     fut_gap_severe = False
-    if not nq_err and len(nq_close) >= 2:
+    if len(nq_close) >= 2:
         fut_curr = float(nq_close.iloc[-1])
         fut_prev = float(nq_close.iloc[-2])
         if fut_prev > 0:
@@ -239,7 +314,7 @@ def calculate_ultra_risk_score():
     is_ranging_market = (bb_width <= 4.0)
     peak_52w = float(qqq_close.tail(252).max())
     drawdown = ((current_close / peak_52w) - 1) * 100
-    date_tag = pd.to_datetime(qqq_last_date).strftime('%m/%d')
+    date_tag = qqq_d.strftime('%m/%d')
 
     # 지표 1: 200일 이격 Z-Score
     disp_mean = float(disp200_s.mean())
@@ -302,7 +377,7 @@ def calculate_ultra_risk_score():
     breadth_divergence = 0.0
     z_breadth = 0.0
     try:
-        qqqe_close, _, _, _ = fetch_realtime_confirmed_data("QQQE")
+        qqqe_close, _, _, _ = fetch_cross_validated_data("QQQE", expected_trading_date)
         if not qqqe_close.empty and len(qqqe_close) >= 20:
             qqqe_ref = float(qqqe_close.iloc[-20])
             qqqe_ret_20d = ((float(qqqe_close.iloc[-1]) / qqqe_ref) - 1) * 100
@@ -350,7 +425,7 @@ def calculate_ultra_risk_score():
         score_hy = s_hy_abs + s_hy_div
         hy_status = "🚨 크레딧 다이버전스" if s_hy_div == 5.0 else ("⚠️ 반등 조짐" if s_hy_div == 2.5 else "🟢 안정")
     else:
-        hy_tag = " ⚠️[API대체]"
+        hy_tag = " ⚠️[수집대체]"
 
     # 지표 7: 순유동성
     score_liq = 0.0
@@ -386,7 +461,7 @@ def calculate_ultra_risk_score():
                 
                 latest_liq_date = a_df['DATE'].iloc[-1]
                 days_lag = (datetime.datetime.now() - latest_liq_date).days
-                liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 8 else ")")
+                liq_date_str = f" ({latest_liq_date.strftime('%m/%d')} 기준" + (", 지연)" if days_lag >= 14 else ")")
 
                 if qqq_20d_ret > 0 and liq_change_4w < -2.0:
                     score_liq = 15.0
@@ -413,7 +488,7 @@ def calculate_ultra_risk_score():
             liq_date_str = " ⚠️[API미연결]"
     except Exception as e:
         print(f"순유동성 연산 에러: {e}")
-        liq_date_str = " ⚠️[API대체]"
+        liq_date_str = " ⚠️[수집대체]"
 
     scores = [score_disp, score_rsi, score_vxn, score_skew, score_term, score_breadth, score_pcr, score_hy, score_liq]
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
