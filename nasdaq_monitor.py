@@ -10,11 +10,9 @@ from zoneinfo import ZoneInfo
 DB_FILE = "history_db.csv"
 
 def get_kst_now():
-    """한국 표준시(KST) 현재 시각"""
     return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
 
 def get_last_us_trading_date():
-    """서머타임 자동 적용 뉴욕 거래소 기준 직전 정규 거래일 날짜 산출"""
     ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
     if ny_now.hour < 16:
         d = ny_now.date() - datetime.timedelta(days=1)
@@ -25,7 +23,6 @@ def get_last_us_trading_date():
     return d
 
 def get_previous_day_record():
-    """자체 DB에서 가장 최근에 저장된 직전 거래일 지표 레코드 조회"""
     if os.path.exists(DB_FILE):
         try:
             db_df = pd.read_csv(DB_FILE)
@@ -36,7 +33,6 @@ def get_previous_day_record():
     return None, 0
 
 def update_and_verify_local_db(record_dict):
-    """[자체 DB 엔진] 전체 지표를 CSV에 누적하고 과거치 무결성 검증"""
     warnings = []
     cols = list(record_dict.keys())
     
@@ -272,19 +268,29 @@ def fetch_equity_pcr():
 
     return 0.58, True
 
-def format_delta(current, prev, is_pct=False, unit="", reverse_color=False):
-    """전일 대비 변화량(Δ) 포맷팅 헬퍼 함수"""
-    if prev is None or np.isnan(prev):
-        return ""
-    diff = current - prev
-    if abs(diff) < 1e-5:
-        return " (전일동일)"
+def format_delta(current, prev, is_pct=False, unit=""):
+    """전일 대비 변화량(Δ) 정밀 포맷팅 (소수점 2자리 기준 0이면 전일동일 출력)"""
+    if prev is None or (isinstance(prev, float) and np.isnan(prev)):
+        return " (기록시작)"
     
+    try:
+        c_val = float(current)
+        p_val = float(prev)
+    except (ValueError, TypeError):
+        return " (기록시작)"
+
     if is_pct:
-        pct_chg = ((current / prev) - 1) * 100 if prev != 0 else 0.0
+        if p_val == 0:
+            return " (전일동일)"
+        pct_chg = ((c_val / p_val) - 1) * 100
+        if abs(round(pct_chg, 2)) == 0.0:
+            return " (전일동일)"
         sign = "+" if pct_chg > 0 else ""
         return f" (Δ {sign}{pct_chg:.2f}%)"
     else:
+        diff = c_val - p_val
+        if abs(round(diff, 2)) == 0.0:
+            return " (전일동일)"
         sign = "+" if diff > 0 else ""
         return f" (Δ {sign}{diff:.2f}{unit})"
 
@@ -335,7 +341,7 @@ def calculate_ultra_risk_score():
     if hy_err: data_warnings.append("⚠️ FRED 하이일드 스프레드 수신 오류")
     if walcl_err or tga_err or rrp_err: data_warnings.append("⚠️ FRED 순유동성 데이터 수신 오류")
 
-    # 4. 순수 야간 선물 갭 감지
+    # 4. 야간 선물 갭 감지
     overnight_gap_pct, nq_err = fetch_overnight_futures_gap()
     fut_gap_status = ""
     fut_gap_severe = False
@@ -372,13 +378,13 @@ def calculate_ultra_risk_score():
     qqq_ref = float(qqq_close.iloc[-20]) if len(qqq_close) >= 20 else current_close
     qqq_20d_ret = ((current_close / qqq_ref) - 1) * 100
 
-    # 지표 1: 200일 이격 Z
+    # 지표 1: 200일 이격 Z (7.5점)
     disp_mean = float(disp200_s.mean())
     disp_std = float(disp200_s.std())
     z_disp = float((disp_200 - disp_mean) / disp_std) if disp_std > 0 else 0.0
     score_disp = float(np.clip(z_disp * (7.5 / 2.0), 0, 7.5))
 
-    # 지표 2: 주봉 RSI
+    # 지표 2: 주봉 RSI (7.5점)
     qqq_w = qqq_close.resample('W-FRI').last().ffill().bfill()
     delta_w = qqq_w.diff()
     gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean().ffill().bfill()
@@ -388,7 +394,7 @@ def calculate_ultra_risk_score():
     if np.isnan(weekly_rsi): weekly_rsi = 50.0
     score_rsi = float(np.clip((weekly_rsi - 50) * (7.5 / 30), 0, 7.5))
 
-    # 지표 3: VXN
+    # 지표 3: VXN (7.0점)
     vxn_20d_ago = float(vxn_close_s.iloc[-20]) if len(vxn_close_s) >= 20 else vxn_current
     vxn_change_20d = vxn_current - vxn_20d_ago
     score_vxn = 0.0
@@ -400,7 +406,7 @@ def calculate_ultra_risk_score():
     elif vxn_current <= 14.0:
         score_vxn = 2.0; vxn_status = "⚠️ 변동성 극저점"
 
-    # 지표 4: SKEW
+    # 지표 4: SKEW (7.0점)
     score_skew = float(np.clip((skew_current - 120) * (7.0 / 25), 0, 7.0))
     vix1d_tag = ""
     if len(vix1d_close_s) >= 5 and vix_current_val > 0:
@@ -412,13 +418,13 @@ def calculate_ultra_risk_score():
                 regime_alerts.append(f"0DTE 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x)")
     skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
 
-    # 지표 5: 기간구조
+    # 지표 5: 기간구조 (6.0점)
     if np.isnan(vix3m_val) or vix3m_val <= 0: vix3m_val = vix_current_val * 1.1
     vix_ratio = round(vix_current_val / vix3m_val, 2)
     score_term = float(np.clip((vix_ratio - 0.80) * (6.0 / 0.20), 0, 6.0))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 지표 6: QQQ/QQQE 쏠림
+    # 지표 6: QQQ/QQQE 쏠림 (8.0점)
     score_breadth = 0.0
     breadth_divergence = 0.0
     z_breadth = 0.0
@@ -440,7 +446,7 @@ def calculate_ultra_risk_score():
     except Exception:
         pass
 
-    # 지표 7: HYG/TLT 크레딧
+    # 지표 7: HYG/TLT 크레딧 (7.0점)
     score_hyg_tlt = 0.0
     hyg_tlt_status = "🟢 안정"
     hyg_tlt_ratio_val = 0.0
@@ -460,12 +466,12 @@ def calculate_ultra_risk_score():
     except Exception:
         pass
 
-    # 지표 8: PCR
+    # 지표 8: PCR (5.0점)
     pcr_val, pcr_is_fallback = fetch_equity_pcr()
     score_pcr = float(np.clip((0.85 - pcr_val) * (5.0 / 0.35), 0, 5.0))
     pcr_tag = " ⚠️[Fallback적용]" if pcr_is_fallback else ""
 
-    # 지표 9: SOFR-IORB
+    # 지표 9: SOFR-IORB (10.0점)
     score_money_market = 0.0
     sofr_iorb_spread_bps = 0.0
     sofr_status = "🟢 정상"
@@ -483,7 +489,7 @@ def calculate_ultra_risk_score():
     except Exception:
         pass
 
-    # 지표 10: 환율 (DXY, USDJPY)
+    # 지표 10: 환율 (DXY 5점 + USDJPY 5점 = 10.0점)
     score_fx = 0.0
     dxy_val, usdjpy_val = 0.0, 0.0
     dxy_status, usdjpy_status = "🟢 안정", "🟢 안정"
@@ -509,7 +515,7 @@ def calculate_ultra_risk_score():
     except Exception:
         pass
 
-    # 지표 11: FRED 하이일드
+    # 지표 11: FRED 하이일드 (12.0점)
     score_hy = 0.0
     hy_current = 0.0
     hy_status = "🟢 안정"
@@ -524,7 +530,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 지표 12: 순유동성
+    # 지표 12: 순유동성 (13.0점)
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -566,6 +572,7 @@ def calculate_ultra_risk_score():
     macd_deadcross = (macd_curr < sig_curr)
     below_sma5 = (current_close < sma5)
     below_sma20 = (current_close < sma20)
+    below_sma50 = (current_close < sma50)
 
     # ── [3단계] 미시 수급 & 캔들 가격행동 ──
     vol_20d_avg = qqq_df['Volume'].rolling(20).mean().iloc[-1]
@@ -591,7 +598,7 @@ def calculate_ultra_risk_score():
     elif hammer_reversal: flow_status = f"💎 <b>[밑꼬리 반등 핀바]</b> 저가 매수세 방어"
     else: flow_status = f"🟢 <b>[수급 정상]</b> 거래량 비율: {vol_ratio:.2f}x"
 
-    # ── [4단계] 동적 포지션 사이징 ──
+    # ── [4단계] 동적 포지션 사이징 & 다중 자산 배분 ──
     tr1 = qqq_df['High'] - qqq_df['Low']
     tr2 = (qqq_df['High'] - qqq_df['Close'].shift(1)).abs()
     tr3 = (qqq_df['Low'] - qqq_df['Close'].shift(1)).abs()
@@ -606,58 +613,86 @@ def calculate_ultra_risk_score():
         vol_cap_tag = f" (🔥고변동성 장세 ATR {atr_pct:.1f}% ➔ 기본 비중 75% 캡 제한)"
 
     target_tqqq_pos = 1.0 * vol_cap
-    is_macro_headwind = (liq_change_4w < -1.0) or (hy_current >= 4.0) or (sofr_iorb_spread_bps >= 5.0) or (score_fx >= 5.0)
+    target_kr2x_pos = 1.0 * vol_cap
 
     if fut_gap_severe:
-        tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> 야간선물 -1.5% 급락 👉 <b>프리마켓/시초가 TQQQ 30% 선제 축소</b> (슬리피지 방어)"
-        target_tqqq_pos = 0.7 * vol_cap
         qqq_action = "🟢 <b>[안정 국면]</b> 1배수는 노이즈 무시하고 100% 홀딩"
+        kr2x_action = "🚨 <b>[선물 급락 대응 (09:15 이후)]</b> 👉 <b>국내 2배수 20% 분할 매도 (KOFR/CD금리 이동)</b>"
+        tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> 야간선물 -1.5% 급락 👉 <b>프리마켓/시초가 TQQQ 25% 선제 축소</b> (슬리피지 방어)"
+        target_kr2x_pos = 0.8 * vol_cap
+        target_tqqq_pos = 0.75 * vol_cap
     elif total_score >= 80:
         if below_sma5 or macd_deadcross or shooting_star_reversal:
-            tqqq_action = "🚨 <b>[대세 탈출 격발 (4단계 확정)]</b> 👉 <b>TQQQ 전량 매도 (현금 100% ➡️ SGOV 파킹)</b>"
-            qqq_action = "🚨 <b>[대세 고점 격발]</b> 👉 <b>QQQ 50% 분할 매도 (현금 50% 확보)</b>"
+            qqq_action = "🚨 <b>[대세 고점 4차 격발]</b> 👉 <b>QQQ 잔여 전량 매도 (현금 100% 확보)</b>"
+            kr2x_action = "🚨 <b>[대세 탈출 4차 격발]</b> 👉 <b>국내 2배수 전량 청산 (100% KOFR/CD금리 파킹)</b>"
+            tqqq_action = "🚨 <b>[대세 탈출 4차 격발]</b> 👉 <b>TQQQ 전량 청산 (100% SGOV 파킹)</b>"
+            target_kr2x_pos = 0.0
             target_tqqq_pos = 0.0
         else:
+            qqq_action = "⚠️ <b>[대세 과열 - 추세 홀딩]</b> 5일선 지지 중. 5일선 이탈 즉시 매도 대기"
+            kr2x_action = "⚠️ <b>[대세 과열 - 추세 홀딩]</b> 5일선 지지 중. 5일선 이탈 시 전량 매도 대기"
             tqqq_action = "⚠️ <b>[대세 과열 - 추세 홀딩]</b> 5일선 지지 중. 5일선 붕괴 즉시 전량 탈출 대기"
-            qqq_action = "⚠️ <b>[대세 과열 - 추세 홀딩]</b> 5일선 지지 중. 5일선 이탈 즉시 50% 매도 대기"
+            target_kr2x_pos = 1.0 * vol_cap
             target_tqqq_pos = 1.0 * vol_cap
     elif total_score >= 65:
-        if (below_sma5 and macd_deadcross) or heavy_volume_sell:
-            tqqq_action = "🚨 <b>[중기 조정 격발 (거래량 실린 이탈)]</b> 👉 <b>TQQQ 50% 분할 매도 (SGOV 파킹)</b>"
-            qqq_action = "🚨 <b>[중기 조정 격발]</b> 👉 <b>QQQ 30% 분할 매도</b>"
-            target_tqqq_pos = 0.5 * vol_cap
+        if below_sma50 or (below_sma5 and macd_deadcross and below_sma20):
+            qqq_action = "🚨 <b>[중기 침체 3차 격발]</b> 👉 <b>QQQ 30% 추가 매도 (누적 현금 70% / 주식 30%)</b>"
+            kr2x_action = "🚨 <b>[중기 침체 3차 격발]</b> 👉 <b>국내 2배수 30% 추가 매도 (누적 KOFR 80% / 주식 20%)</b>"
+            tqqq_action = "🚨 <b>[중기 침체 3차 격발]</b> 👉 <b>TQQQ 25% 추가 매도 (누적 SGOV 85% / 주식 15%)</b>"
+            target_kr2x_pos = 0.2 * vol_cap
+            target_tqqq_pos = 0.15 * vol_cap
+        elif (below_sma5 and macd_deadcross) or heavy_volume_sell or below_sma20:
+            qqq_action = "🚨 <b>[중기 균열 2차 격발]</b> 👉 <b>QQQ 25% 추가 매도 (누적 현금 40% / 주식 60%)</b>"
+            kr2x_action = "🚨 <b>[중기 균열 2차 격발]</b> 👉 <b>국내 2배수 30% 추가 매도 (누적 KOFR 50% / 주식 50%)</b>"
+            tqqq_action = "🚨 <b>[중기 균열 2차 격발]</b> 👉 <b>TQQQ 35% 추가 매도 (누적 SGOV 60% / 주식 40%)</b>"
+            target_kr2x_pos = 0.5 * vol_cap
+            target_tqqq_pos = 0.4 * vol_cap
         elif below_sma5:
             if low_volume_pullback or hammer_reversal:
-                tqqq_action = "⚖️ <b>[1차 균열 유예 — 수급 방어 확인]</b> 거래량 적은 이탈/밑꼬리 반등 ➔ <b>TQQQ 100% 유지하며 관망</b>"
-                qqq_action = "⚖️ <b>[추세 관망]</b> QQQ 100% 유지"
+                qqq_action = "⚖️ <b>[추세 관망]</b> 거래량 없는 눌림목 ➔ QQQ 100% 유지"
+                kr2x_action = "⚖️ <b>[수급 방어 유예]</b> 거래량 없는 이탈 ➔ <b>국내 2배수 100% 유지하며 관망</b>"
+                tqqq_action = "⚖️ <b>[1차 균열 유예 — 수급 방어]</b> ➔ <b>TQQQ 100% 유지하며 다음 날 확인</b>"
+                target_kr2x_pos = 1.0 * vol_cap
                 target_tqqq_pos = 1.0 * vol_cap
             else:
-                tqqq_action = "⚠️ <b>[1차 균열 확정]</b> 👉 <b>TQQQ 30% 1차 분할 익절 (SGOV 파킹)</b>"
-                qqq_action = "⚠️ <b>[과열 구간 1차 균열]</b> 👉 <b>QQQ 20% 1차 분할 익절</b>"
-                target_tqqq_pos = 0.7 * vol_cap
+                qqq_action = "⚠️ <b>[과열권 1차 경계]</b> 👉 <b>QQQ 15% 1차 분할 익절 (현금 15%)</b>"
+                kr2x_action = "⚠️ <b>[과열권 1차 경계]</b> 👉 <b>국내 2배수 20% 1차 분할 익절 (KOFR 20%)</b>"
+                tqqq_action = "⚠️ <b>[과열권 1차 경계]</b> 👉 <b>TQQQ 25% 1차 분할 익절 (SGOV 25%)</b>"
+                target_kr2x_pos = 0.8 * vol_cap
+                target_tqqq_pos = 0.75 * vol_cap
         else:
-            tqqq_action = "⚖️ <b>[과열 랠리 홀딩]</b> 5일선 지지 지속. 섣부른 조기 매도 없이 100% 유지"
             qqq_action = "⚖️ <b>[과열권 추세 지속]</b> 100% 포지션 유지"
+            kr2x_action = "⚖️ <b>[과열 랠리 홀딩]</b> 5일선 지지 지속. 2배수 100% 유지"
+            tqqq_action = "⚖️ <b>[과열 랠리 홀딩]</b> 5일선 지지 지속. 3배수 100% 유지"
+            target_kr2x_pos = 1.0 * vol_cap
             target_tqqq_pos = 1.0 * vol_cap
     elif is_ranging_market and total_score < 65:
         if below_sma20:
-            tqqq_action = "⚠️ <b>[박스권 하단 이탈]</b> 20일선 붕괴. 👉 <b>TQQQ 50% 비중 축소 (SGOV 대기)</b>"
-            qqq_action = "⚠️ <b>[박스권 하단 이탈]</b> 20일선 이탈. 보유 주식 20% 비중 축소"
-            target_tqqq_pos = 0.5 * vol_cap
+            qqq_action = "⚠️ <b>[박스권 하단 이탈]</b> 20일선 이탈. 👉 <b>보유 주식 15% 비중 축소</b>"
+            kr2x_action = "⚠️ <b>[박스권 하단 이탈]</b> 20일선 붕괴. 👉 <b>국내 2배수 30% 비중 축소 (KOFR 대기)</b>"
+            tqqq_action = "⚠️ <b>[박스권 하단 이탈]</b> 20일선 붕괴. 👉 <b>TQQQ 40% 비중 축소 (SGOV 대기)</b>"
+            target_kr2x_pos = 0.7 * vol_cap
+            target_tqqq_pos = 0.6 * vol_cap
         else:
-            tqqq_action = "🔒 <b>[횡보 휩소 방지 모드 (BB Width ≤ 4.0%)]</b> 5일선 잔파도 진입 금지, 20일선 지지 확인하며 유지"
             qqq_action = "📦 <b>[박스권 횡보]</b> 20일선 지지 확인하며 100% 유지"
+            kr2x_action = "🔒 <b>[횡보 휩소 방지 모드]</b> 5일선 잔파도 진입 금지, 20일선 지지 확인하며 유지"
+            tqqq_action = "🔒 <b>[횡보 휩소 방지 모드]</b> 5일선 잔파도 진입 금지, 20일선 지지 확인하며 유지"
+            target_kr2x_pos = 1.0 * vol_cap
             target_tqqq_pos = 1.0 * vol_cap
     elif total_score >= 40:
-        tqqq_action = "🟢 <b>[상승 추세 순항]</b> TQQQ 100% 포지션 유지 (본전스탑 트레일링 가동)"
         qqq_action = "🟢 <b>[건전한 추세 / 중립]</b> QQQ 100% 유지"
+        kr2x_action = "🟢 <b>[상승 추세 순항]</b> 국내 2배수 100% 포지션 유지"
+        tqqq_action = "🟢 <b>[상승 추세 순항]</b> TQQQ 100% 포지션 유지"
+        target_kr2x_pos = 1.0 * vol_cap
         target_tqqq_pos = 1.0 * vol_cap
     else:
-        tqqq_action = "🟢 <b>[안정 국면]</b> TQQQ 100% 포지션 유지"
         qqq_action = "🟢 <b>[안정 국면]</b> QQQ 100% 유지"
+        kr2x_action = "🟢 <b>[안정 국면]</b> 국내 2배수 100% 포지션 유지"
+        tqqq_action = "🟢 <b>[안정 국면]</b> TQQQ 100% 포지션 유지"
+        target_kr2x_pos = 1.0 * vol_cap
         target_tqqq_pos = 1.0 * vol_cap
 
-    # 바닥 탐색 모드 (-10% 하락 시)
+    # ── 바닥 탐색 모드 (-10% 하락 시) ──
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
@@ -670,51 +705,42 @@ def calculate_ultra_risk_score():
         if not below_sma5: b_score += 25.0
         if not macd_deadcross: b_score += 25.0
 
-        if b_score >= 75:
-            qqq_b_action = "💎 <b>[찐바닥 확정]</b> 잔여 현금 40% 전량 투입 (주식 100% 완전 복귀)"
-            tqqq_target_b = 1.0
+        if b_score >= 100:
+            qqq_b_action = "💎 <b>[4차 어깨 완전복귀]</b> 잔여 현금 30% 전량 투입 (주식 100% 완전 복귀)"
+            kr2x_b_action = "💎 <b>[4차 어깨 완전복귀]</b> 잔여 KOFR 25% 전량 투입 (2배수 100% 완전 복귀)"
+            tqqq_b_action = "💎 <b>[4차 어깨 완전복귀]</b> 잔여 SGOV 30% 전량 투입 (TQQQ 100% 완전 복귀)"
+            target_kr2x_pos, target_tqqq_pos = 1.0, 1.0
+        elif b_score >= 75:
+            qqq_b_action = "🚀 <b>[3차 허리 진입]</b> 보유 현금의 30% 매수 (누적 주식 70%)"
+            kr2x_b_action = "🚀 <b>[3차 허리 진입]</b> 보유 KOFR의 30% 매수 (누적 2배수 75% / KOFR 25%)"
+            tqqq_b_action = "🚀 <b>[3차 허리 진입]</b> 보유 SGOV의 35% 매수 (누적 TQQQ 70% / SGOV 30%)"
+            target_kr2x_pos, target_tqqq_pos = 0.75, 0.70
         elif b_score >= 50:
-            qqq_b_action = "🚀 <b>[2차 정석 비중 확대]</b> 보유 현금의 35% 2차 매수 (누적 주식 60%)"
-            tqqq_target_b = 0.5
+            qqq_b_action = "🟢 <b>[2차 무릎 매수]</b> 보유 현금의 25% 매수 (누적 주식 40%)"
+            kr2x_b_action = "🟢 <b>[2차 무릎 매수]</b> 보유 KOFR의 30% 매수 (누적 2배수 45% / KOFR 55%)"
+            tqqq_b_action = "🟢 <b>[2차 무릎 매수]</b> 보유 SGOV의 25% 매수 (누적 TQQQ 35% / SGOV 65%)"
+            target_kr2x_pos, target_tqqq_pos = 0.45, 0.35
         elif b_score >= 25:
-            qqq_b_action = "🟢 <b>[1차 정강이 매수]</b> 보유 현금의 25% 1차 매수 (누적 주식 25%)"
-            tqqq_target_b = 0.25
+            qqq_b_action = "🟢 <b>[1차 정강이 정찰]</b> 보유 현금의 15% 매수 (누적 주식 15%)"
+            kr2x_b_action = "🟢 <b>[1차 정강이 정찰]</b> 보유 KOFR의 15% 매수 (누적 2배수 15% / KOFR 85%)"
+            tqqq_b_action = "🟢 <b>[1차 정강이 정찰]</b> 보유 SGOV의 10% 매수 (누적 TQQQ 10% / SGOV 90%)"
+            target_kr2x_pos, target_tqqq_pos = 0.15, 0.10
         else:
             qqq_b_action = "⏳ <b>[패닉 진행 중]</b> 현금 100% 보존하며 바닥 신호 대기"
-            tqqq_target_b = 0.0
-
-        if is_macro_headwind:
-            headwind_tag = "⚠️ <b>[거시/환율 역풍 구간 — TQQQ 투입 총량 50% 캡 제한]</b>\n"
-            tqqq_target_b = min(0.5, tqqq_target_b)
-            if b_score >= 75:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>잔여 20% 투입 (누적 TQQQ 50% / 잔여 50%는 SGOV 보존)</b>\n   └ <i>수익률 +10% 도달 시 본전스탑 필수</i>"
-            elif b_score >= 50:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 2차 매수 (누적 TQQQ 30% / SGOV 70%)</b>"
-            elif b_score >= 25:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 1차 매수 (누적 TQQQ 15% / SGOV 85%)</b>"
-            else:
-                tqqq_b_action = f"{headwind_tag}   👉 SGOV 100% 파킹 유지하며 바닥 신호 대기"
-        else:
-            headwind_tag = "🟢 <b>[거시 순풍 구간 — TQQQ 100% 정상 투입 가능]</b>\n"
-            if b_score >= 75:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>잔여 현금 50% 전량 투입 (TQQQ 100% 완전 복귀)</b>"
-            elif b_score >= 50:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 35% 2차 매수 (누적 TQQQ 50%)</b>"
-            elif b_score >= 25:
-                tqqq_b_action = f"{headwind_tag}   👉 <b>현금의 15% 1차 매수 (누적 TQQQ 15%)</b>"
-            else:
-                tqqq_b_action = f"{headwind_tag}   👉 현금(SGOV) 100% 보존 대기"
+            kr2x_b_action = "⏳ <b>[패닉 진행 중]</b> KOFR 100% 파킹 유지하며 바닥 신호 대기"
+            tqqq_b_action = "⏳ <b>[패닉 진행 중]</b> SGOV 100% 파킹 유지하며 바닥 신호 대기"
+            target_kr2x_pos, target_tqqq_pos = 0.0, 0.0
 
         bottom_section = (
             f"────────────────\n"
             f"🎯 <b>[정밀 바닥 탐색 모드 (고점 대비 {drawdown:.1f}%)]</b>\n"
-            f"• 바닥 완성도: <b>{b_score:.0f} / 100점</b> (VIX 피크: {'🟢' if vix_peaked else '🔴'} | 기간구조: {'🟢' if term_normalized else '🔴'})\n\n"
+            f"• 바닥 점수: <b>{b_score:.0f} / 100점</b> (VIX 피크: {'🟢' if vix_peaked else '🔴'} | 기간구조: {'🟢' if term_normalized else '🔴'} | 5일선: {'🟢' if not below_sma5 else '🔴'} | MACD: {'🟢' if not macd_deadcross else '🔴'})\n\n"
             f"📘 <b>[QQQ 1배수 바닥 지침]</b>\n{qqq_b_action}\n\n"
-            f"📙 <b>[TQQQ 3배수 기관급 바닥 지침]</b>\n{tqqq_b_action}\n"
+            f"📗 <b>[국내 나스닥 2배수 바닥 지침 (09:15 이후)]</b>\n{kr2x_b_action}\n\n"
+            f"📙 <b>[미국 TQQQ 3배수 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
-        target_tqqq_pos = tqqq_target_b
 
-    # ── 자체 DB 기록 딕셔너리 생성 및 무결성 검증 ──
+    # ── 자체 DB 기록 ──
     current_record = {
         'Date': str(qqq_d),
         'QQQ': round(current_close, 2),
@@ -738,7 +764,7 @@ def calculate_ultra_risk_score():
     if db_warnings:
         data_warnings.extend(db_warnings)
 
-    # ── 전일 대비 변화량(Δ) 문자열 생성 ──
+    # ── 전일 대비 변화량(Δ) 생성 ──
     p_rec = prev_db_rec if prev_db_rec else {}
     d_qqq = format_delta(current_close, p_rec.get('QQQ'), is_pct=True)
     d_tqqq = format_delta(current_tqqq, p_rec.get('TQQQ'), is_pct=True)
@@ -769,7 +795,7 @@ def calculate_ultra_risk_score():
     kst_now_str = get_kst_now().strftime('%Y-%m-%d %H:%M')
 
     report = (
-        f"📊 <b>[QQQ & TQQQ 4단계 정밀 판독기]</b>\n"
+        f"📊 <b>[나스닥 1배·2배·3배 4단계 정밀 판독기]</b>\n"
         f"📅 기준(KST): {kst_now_str} (자체DB: {db_total_days}일 누적)\n\n"
         f"{warning_banner}"
         f"{regime_banner}"
@@ -781,10 +807,13 @@ def calculate_ultra_risk_score():
         f"🎯 <b>1단계 매크로 점수: {total_score} / 100점</b>{d_score}\n"
         f"⚡ <b>2단계 일봉 추세:</b> {'🔴 5일선 이탈' if below_sma5 else '🟢 5일선 지지'} | {'🔴 MACD 데드' if macd_deadcross else '🟢 MACD 상승'}\n"
         f"🌊 <b>3단계 수급/캔들:</b> {flow_status}\n"
-        f"🎯 <b>4단계 목표 비중:</b> <b>TQQQ {target_tqqq_pos*100:.0f}%</b> | <b>SGOV 현금 {(1-target_tqqq_pos)*100:.0f}%</b>\n"
+        f"🎯 <b>4단계 목표 비중:</b>\n"
+        f"   • <b>국내 2배수:</b> <b>{target_kr2x_pos*100:.0f}%</b> | <b>KOFR 파킹: {(1-target_kr2x_pos)*100:.0f}%</b>\n"
+        f"   • <b>미국 TQQQ:</b> <b>{target_tqqq_pos*100:.0f}%</b> | <b>SGOV 파킹: {(1-target_tqqq_pos)*100:.0f}%</b>\n"
         f"────────────────\n"
         f"📘 <b>[QQQ 1배수 정석 전략]</b>\n{qqq_action}\n\n"
-        f"📙 <b>[TQQQ 3배수 기관급 전략 (세금/스왑/갭 방어)]</b>\n{tqqq_action}\n"
+        f"📗 <b>[국내 나스닥 2배수 전략 (09:15 이후 체결)]</b>\n{kr2x_action}\n\n"
+        f"📙 <b>[미국 TQQQ 3배수 기관급 전략 (SGOV 파킹)]</b>\n{tqqq_action}\n"
         f"{bottom_section}"
         f"────────────────\n"
         f"📈 <b>[시장 정밀 매크로 데이터 & 전일 대비 변화(Δ)]</b>\n"
