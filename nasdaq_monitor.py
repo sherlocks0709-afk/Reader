@@ -24,32 +24,38 @@ def get_last_us_trading_date():
         d -= datetime.timedelta(days=1)
     return d
 
-def update_and_verify_local_db(date_str, qqq_p, tqqq_p, vxn_p, skew_p, score_val, pos_val):
-    """[자체 DB 엔진] CSV에 매일 기록하고 과거 데이터 무결성을 대조 검증"""
+def get_previous_day_record():
+    """자체 DB에서 가장 최근에 저장된 직전 거래일 지표 레코드 조회"""
+    if os.path.exists(DB_FILE):
+        try:
+            db_df = pd.read_csv(DB_FILE)
+            if not db_df.empty:
+                return db_df.iloc[-1].to_dict(), len(db_df)
+        except Exception:
+            pass
+    return None, 0
+
+def update_and_verify_local_db(record_dict):
+    """[자체 DB 엔진] 전체 지표를 CSV에 누적하고 과거치 무결성 검증"""
     warnings = []
+    cols = list(record_dict.keys())
+    
     if os.path.exists(DB_FILE):
         try:
             db_df = pd.read_csv(DB_FILE)
             db_df['Date'] = db_df['Date'].astype(str)
         except Exception:
-            db_df = pd.DataFrame(columns=['Date', 'QQQ', 'TQQQ', 'VXN', 'SKEW', 'Score', 'Target_Pos'])
+            db_df = pd.DataFrame(columns=cols)
     else:
-        db_df = pd.DataFrame(columns=['Date', 'QQQ', 'TQQQ', 'VXN', 'SKEW', 'Score', 'Target_Pos'])
+        db_df = pd.DataFrame(columns=cols)
 
+    date_str = str(record_dict['Date'])
     if date_str in db_df['Date'].values:
         past_row = db_df[db_df['Date'] == date_str].iloc[-1]
-        if abs(float(past_row['QQQ']) - qqq_p) > 0.05:
-            warnings.append(f"🚨 [DB 대조 불일치] {date_str} 저장 종가(${past_row['QQQ']}) vs 수집 종가(${qqq_p:.2f})")
+        if abs(float(past_row['QQQ']) - float(record_dict['QQQ'])) > 0.05:
+            warnings.append(f"🚨 [DB 불일치] {date_str} 저장 종가(${past_row['QQQ']}) vs 수집 종가(${record_dict['QQQ']:.2f})")
     else:
-        new_row = pd.DataFrame([{
-            'Date': date_str,
-            'QQQ': round(qqq_p, 2),
-            'TQQQ': round(tqqq_p, 2),
-            'VXN': round(vxn_p, 2),
-            'SKEW': round(skew_p, 2),
-            'Score': round(score_val, 1),
-            'Target_Pos': round(pos_val, 2)
-        }])
+        new_row = pd.DataFrame([record_dict])
         db_df = pd.concat([db_df, new_row], ignore_index=True)
         db_df.drop_duplicates(subset=['Date'], keep='last', inplace=True)
         db_df.sort_values('Date', inplace=True)
@@ -58,7 +64,6 @@ def update_and_verify_local_db(date_str, qqq_p, tqqq_p, vxn_p, skew_p, score_val
     return warnings, len(db_df)
 
 def fetch_yahoo_v8_chart(ticker_symbol):
-    """야후 v8 공식 Chart API에서 OHLCV 수집"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
     try:
@@ -267,14 +272,31 @@ def fetch_equity_pcr():
 
     return 0.58, True
 
+def format_delta(current, prev, is_pct=False, unit="", reverse_color=False):
+    """전일 대비 변화량(Δ) 포맷팅 헬퍼 함수"""
+    if prev is None or np.isnan(prev):
+        return ""
+    diff = current - prev
+    if abs(diff) < 1e-5:
+        return " (전일동일)"
+    
+    if is_pct:
+        pct_chg = ((current / prev) - 1) * 100 if prev != 0 else 0.0
+        sign = "+" if pct_chg > 0 else ""
+        return f" (Δ {sign}{pct_chg:.2f}%)"
+    else:
+        sign = "+" if diff > 0 else ""
+        return f" (Δ {sign}{diff:.2f}{unit})"
+
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
     data_warnings = []
     regime_alerts = []
 
     expected_trading_date = get_last_us_trading_date()
+    prev_db_rec, db_total_days = get_previous_day_record()
 
-    # 1. 다중 시세 및 OHLCV 데이터 수집
+    # 1. 시세 및 변동성 수집
     qqq_df, current_close, qqq_d, w_qqq = fetch_cross_validated_data("QQQ", expected_trading_date)
     tqqq_df, current_tqqq, tqqq_d, w_tqqq = fetch_cross_validated_data("TQQQ", expected_trading_date)
     vix_df, vix_current_val, vix_d, w_vix = fetch_cross_validated_data("^VIX", expected_trading_date)
@@ -324,9 +346,7 @@ def calculate_ultra_risk_score():
         elif overnight_gap_pct >= 1.5:
             fut_gap_status = f"🚀 <b>[장마감 후 야간 NQ선물 추가급등]</b> 야간선물: <b>{overnight_gap_pct:+.2f}%</b>\n"
 
-    # =========================================================================
-    # ── [1단계] 매크로 & 구조 환경 평가 (총 100점 점수화) ──
-    # =========================================================================
+    # ── [1단계] 매크로 & 구조 환경 평가 ──
     sma5_s = qqq_close.rolling(window=5).mean().ffill().bfill()
     sma20_s = qqq_close.rolling(window=20).mean().ffill().bfill()
     sma50_s = qqq_close.rolling(window=50).mean().ffill().bfill()
@@ -352,13 +372,13 @@ def calculate_ultra_risk_score():
     qqq_ref = float(qqq_close.iloc[-20]) if len(qqq_close) >= 20 else current_close
     qqq_20d_ret = ((current_close / qqq_ref) - 1) * 100
 
-    # 1-1. 200일 이격 Z-Score (7.5점)
+    # 지표 1: 200일 이격 Z
     disp_mean = float(disp200_s.mean())
     disp_std = float(disp200_s.std())
     z_disp = float((disp_200 - disp_mean) / disp_std) if disp_std > 0 else 0.0
     score_disp = float(np.clip(z_disp * (7.5 / 2.0), 0, 7.5))
 
-    # 1-2. 주봉 RSI (7.5점)
+    # 지표 2: 주봉 RSI
     qqq_w = qqq_close.resample('W-FRI').last().ffill().bfill()
     delta_w = qqq_w.diff()
     gain_w = (delta_w.where(delta_w > 0, 0)).rolling(window=14).mean().ffill().bfill()
@@ -368,22 +388,19 @@ def calculate_ultra_risk_score():
     if np.isnan(weekly_rsi): weekly_rsi = 50.0
     score_rsi = float(np.clip((weekly_rsi - 50) * (7.5 / 30), 0, 7.5))
 
-    # 1-3. VXN 20일 다이버전스 (7.0점)
+    # 지표 3: VXN
     vxn_20d_ago = float(vxn_close_s.iloc[-20]) if len(vxn_close_s) >= 20 else vxn_current
     vxn_change_20d = vxn_current - vxn_20d_ago
     score_vxn = 0.0
     vxn_status = "🟢 변동성 안정"
     if qqq_20d_ret > 0 and vxn_change_20d >= 2.0:
-        score_vxn = 7.0
-        vxn_status = "🚨 스마트머니 풋 매집"
+        score_vxn = 7.0; vxn_status = "🚨 스마트머니 풋 매집"
     elif qqq_20d_ret > 0 and vxn_change_20d >= 0.5:
-        score_vxn = 3.5
-        vxn_status = "⚠️ 변동성 지지 조짐"
+        score_vxn = 3.5; vxn_status = "⚠️ 변동성 지지 조짐"
     elif vxn_current <= 14.0:
-        score_vxn = 2.0
-        vxn_status = "⚠️ 변동성 극저점"
+        score_vxn = 2.0; vxn_status = "⚠️ 변동성 극저점"
 
-    # 1-4. SKEW & 0DTE (7.0점)
+    # 지표 4: SKEW
     score_skew = float(np.clip((skew_current - 120) * (7.0 / 25), 0, 7.0))
     vix1d_tag = ""
     if len(vix1d_close_s) >= 5 and vix_current_val > 0:
@@ -395,13 +412,13 @@ def calculate_ultra_risk_score():
                 regime_alerts.append(f"0DTE 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x)")
     skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
 
-    # 1-5. 기간구조 (6.0점)
+    # 지표 5: 기간구조
     if np.isnan(vix3m_val) or vix3m_val <= 0: vix3m_val = vix_current_val * 1.1
     vix_ratio = round(vix_current_val / vix3m_val, 2)
     score_term = float(np.clip((vix_ratio - 0.80) * (6.0 / 0.20), 0, 6.0))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 1-6. QQQ vs QQQE 쏠림 동적 Z-Score (8.0점)
+    # 지표 6: QQQ/QQQE 쏠림
     score_breadth = 0.0
     breadth_divergence = 0.0
     z_breadth = 0.0
@@ -423,7 +440,7 @@ def calculate_ultra_risk_score():
     except Exception:
         pass
 
-    # 1-7. HYG / TLT 일별 크레딧 (7.0점)
+    # 지표 7: HYG/TLT 크레딧
     score_hyg_tlt = 0.0
     hyg_tlt_status = "🟢 안정"
     hyg_tlt_ratio_val = 0.0
@@ -437,20 +454,18 @@ def calculate_ultra_risk_score():
                 hyg_tlt_ratio_val = float(cr_df['Ratio'].iloc[-1])
                 ratio_chg_20d = ((hyg_tlt_ratio_val / float(cr_df['Ratio'].iloc[-20])) - 1) * 100
                 if qqq_20d_ret > 0 and ratio_chg_20d <= -2.5:
-                    score_hyg_tlt = 7.0
-                    hyg_tlt_status = "🚨 크레딧 붕괴 선행"
+                    score_hyg_tlt = 7.0; hyg_tlt_status = "🚨 크레딧 붕괴 선행"
                 elif qqq_20d_ret > 0 and ratio_chg_20d <= -1.0:
-                    score_hyg_tlt = 3.5
-                    hyg_tlt_status = "⚠️ 크레딧 약화 조짐"
+                    score_hyg_tlt = 3.5; hyg_tlt_status = "⚠️ 크레딧 약화 조짐"
     except Exception:
         pass
 
-    # 1-8. Equity PCR (5.0점)
+    # 지표 8: PCR
     pcr_val, pcr_is_fallback = fetch_equity_pcr()
     score_pcr = float(np.clip((0.85 - pcr_val) * (5.0 / 0.35), 0, 5.0))
     pcr_tag = " ⚠️[Fallback적용]" if pcr_is_fallback else ""
 
-    # 1-9. SOFR - IORB 단기자금 (10.0점)
+    # 지표 9: SOFR-IORB
     score_money_market = 0.0
     sofr_iorb_spread_bps = 0.0
     sofr_status = "🟢 정상"
@@ -462,15 +477,13 @@ def calculate_ultra_risk_score():
             if not mm_df.empty:
                 sofr_iorb_spread_bps = (float(mm_df['SOFR'].iloc[-1]) - float(mm_df['IORB'].iloc[-1])) * 100
                 if sofr_iorb_spread_bps >= 8.0:
-                    score_money_market = 10.0
-                    sofr_status = "🚨 단기자금 경색 발작"
+                    score_money_market = 10.0; sofr_status = "🚨 단기자금 경색 발작"
                 elif sofr_iorb_spread_bps >= 3.0:
-                    score_money_market = 5.0
-                    sofr_status = "⚠️ 자금 수요 타이트"
+                    score_money_market = 5.0; sofr_status = "⚠️ 자금 수요 타이트"
     except Exception:
         pass
 
-    # 1-10. 환율 모듈 (DXY 5점 + USDJPY 5점 = 10.0점)
+    # 지표 10: 환율 (DXY, USDJPY)
     score_fx = 0.0
     dxy_val, usdjpy_val = 0.0, 0.0
     dxy_status, usdjpy_status = "🟢 안정", "🟢 안정"
@@ -479,11 +492,9 @@ def calculate_ultra_risk_score():
         if not dxy_df.empty and len(dxy_df) >= 20:
             dxy_chg_20d = ((dxy_val / float(dxy_df['Close'].iloc[-20])) - 1) * 100
             if dxy_chg_20d >= 2.5:
-                score_fx += 5.0
-                dxy_status = f"🚨 달러 급등 (+{dxy_chg_20d:.1f}%)"
+                score_fx += 5.0; dxy_status = f"🚨 달러 급등 (+{dxy_chg_20d:.1f}%)"
             elif dxy_chg_20d >= 1.2:
-                score_fx += 2.5
-                dxy_status = f"⚠️ 달러 강세 (+{dxy_chg_20d:.1f}%)"
+                score_fx += 2.5; dxy_status = f"⚠️ 달러 강세 (+{dxy_chg_20d:.1f}%)"
     except Exception:
         pass
 
@@ -492,15 +503,13 @@ def calculate_ultra_risk_score():
         if not jpy_df.empty and len(jpy_df) >= 20:
             jpy_chg_5d = ((usdjpy_val / float(jpy_df['Close'].iloc[-5])) - 1) * 100
             if jpy_chg_5d <= -2.5:
-                score_fx += 5.0
-                usdjpy_status = f"🚨 엔캐리 청산 경보 ({jpy_chg_5d:.1f}%)"
+                score_fx += 5.0; usdjpy_status = f"🚨 엔캐리 청산 경보 ({jpy_chg_5d:.1f}%)"
             elif jpy_chg_5d <= -1.2:
-                score_fx += 2.5
-                usdjpy_status = f"⚠️ 엔화 강세 ({jpy_chg_5d:.1f}%)"
+                score_fx += 2.5; usdjpy_status = f"⚠️ 엔화 강세 ({jpy_chg_5d:.1f}%)"
     except Exception:
         pass
 
-    # 1-11. FRED 하이일드 스프레드 (12.0점)
+    # 지표 11: FRED 하이일드
     score_hy = 0.0
     hy_current = 0.0
     hy_status = "🟢 안정"
@@ -515,7 +524,7 @@ def calculate_ultra_risk_score():
     else:
         hy_tag = " ⚠️[수집대체]"
 
-    # 1-12. 순유동성 (13.0점)
+    # 지표 12: 순유동성
     score_liq = 0.0
     current_net_liq = 0.0
     liq_change_4w = 0.0
@@ -547,9 +556,7 @@ def calculate_ultra_risk_score():
     clean_scores = [0.0 if np.isnan(s) else s for s in scores]
     total_score = round(sum(clean_scores), 1)
 
-    # =========================================================================
-    # ── [2단계] 기술적 추세 & 체제 필터 (Trend & Regime Filter) ──
-    # =========================================================================
+    # ── [2단계] 일봉 추세 & MACD ──
     ema12 = qqq_close.ewm(span=12, adjust=False).mean()
     ema26 = qqq_close.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -560,17 +567,13 @@ def calculate_ultra_risk_score():
     below_sma5 = (current_close < sma5)
     below_sma20 = (current_close < sma20)
 
-    # =========================================================================
-    # ── [3단계 신규] 미시 수급 & 캔들 가격행동 검증 (Price Action Trigger) ──
-    # =========================================================================
-    # 1) 거래량 가중치 검증 (20일 평균 거래량 대비 당일 거래량 비율)
+    # ── [3단계] 미시 수급 & 캔들 가격행동 ──
     vol_20d_avg = qqq_df['Volume'].rolling(20).mean().iloc[-1]
     curr_vol = qqq_df['Volume'].iloc[-1]
     vol_ratio = (curr_vol / vol_20d_avg) if vol_20d_avg > 0 else 1.0
     heavy_volume_sell = below_sma5 and (vol_ratio >= 1.25)
     low_volume_pullback = below_sma5 and (vol_ratio < 0.85)
 
-    # 2) 캔들 꼬리 분석 (밑꼬리 반등 핀바 / 윗꼬리 매도 클라이맥스)
     c_open = qqq_df['Open'].iloc[-1]
     c_high = qqq_df['High'].iloc[-1]
     c_low = qqq_df['Low'].iloc[-1]
@@ -579,42 +582,32 @@ def calculate_ultra_risk_score():
     lower_wick_ratio = (min(c_open, c_close) - c_low) / candle_range
     upper_wick_ratio = (c_high - max(c_open, c_close)) / candle_range
 
-    hammer_reversal = (lower_wick_ratio >= 0.45) # 긴 밑꼬리 달린 저가 매수세 유입
-    shooting_star_reversal = (upper_wick_ratio >= 0.45) # 윗꼬리 달린 고점 매도 압력
+    hammer_reversal = (lower_wick_ratio >= 0.45)
+    shooting_star_reversal = (upper_wick_ratio >= 0.45)
 
     flow_status = "정상"
-    if heavy_volume_sell:
-        flow_status = f"🚨 <b>[기관 대량 매도 실림]</b> 거래량 {vol_ratio:.2f}x (신호 확정)"
-    elif low_volume_pullback:
-        flow_status = f"⚠️ <b>[거래량 실리지 않은 이탈]</b> 거래량 {vol_ratio:.2f}x (거짓 이탈 가능성 유의)"
-    elif hammer_reversal:
-        flow_status = f"💎 <b>[강력한 밑꼬리 반등 핀바]</b> 저가 매수세 방어 유입"
-    else:
-        flow_status = f"🟢 <b>[수급/거래량 정상]</b> 거래량 비율: {vol_ratio:.2f}x"
+    if heavy_volume_sell: flow_status = f"🚨 <b>[대량 매도 거래량 실림]</b> 거래량 {vol_ratio:.2f}x"
+    elif low_volume_pullback: flow_status = f"⚠️ <b>[거래량 없는 눌림목]</b> 거래량 {vol_ratio:.2f}x"
+    elif hammer_reversal: flow_status = f"💎 <b>[밑꼬리 반등 핀바]</b> 저가 매수세 방어"
+    else: flow_status = f"🟢 <b>[수급 정상]</b> 거래량 비율: {vol_ratio:.2f}x"
 
-    # =========================================================================
-    # ── [4단계 신규] 동적 포지션 사이징 & 손익비 엔진 (Dynamic Position Sizing) ──
-    # =========================================================================
-    # 1) ATR(14) 변동성 측정
+    # ── [4단계] 동적 포지션 사이징 ──
     tr1 = qqq_df['High'] - qqq_df['Low']
     tr2 = (qqq_df['High'] - qqq_df['Close'].shift(1)).abs()
     tr3 = (qqq_df['Low'] - qqq_df['Close'].shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr14 = tr.rolling(14).mean().iloc[-1]
-    atr_pct = (atr14 / current_close) * 100 # QQQ 일일 평균 진폭(%)
+    atr_pct = (atr14 / current_close) * 100
 
-    # 변동성 고조 시 기본 캡 제한
     vol_cap = 1.0
     vol_cap_tag = ""
     if atr_pct >= 2.5:
         vol_cap = 0.75
         vol_cap_tag = f" (🔥고변동성 장세 ATR {atr_pct:.1f}% ➔ 기본 비중 75% 캡 제한)"
 
-    # 2) 종합 4단계 포지션 결정 룰
     target_tqqq_pos = 1.0 * vol_cap
     is_macro_headwind = (liq_change_4w < -1.0) or (hy_current >= 4.0) or (sofr_iorb_spread_bps >= 5.0) or (score_fx >= 5.0)
 
-    # 4단계 종합 포지션 산출
     if fut_gap_severe:
         tqqq_action = "🚨 <b>[선물 갭다운 긴급 방어]</b> 야간선물 -1.5% 급락 👉 <b>프리마켓/시초가 TQQQ 30% 선제 축소</b> (슬리피지 방어)"
         target_tqqq_pos = 0.7 * vol_cap
@@ -635,7 +628,7 @@ def calculate_ultra_risk_score():
             target_tqqq_pos = 0.5 * vol_cap
         elif below_sma5:
             if low_volume_pullback or hammer_reversal:
-                tqqq_action = "⚖️ <b>[1차 균열 유예 — 수급 방어 확인]</b> 거래량 적은 이탈/밑꼬리 반등 ➔ <b>TQQQ 100% 유지하며 다음 날 확인</b>"
+                tqqq_action = "⚖️ <b>[1차 균열 유예 — 수급 방어 확인]</b> 거래량 적은 이탈/밑꼬리 반등 ➔ <b>TQQQ 100% 유지하며 관망</b>"
                 qqq_action = "⚖️ <b>[추세 관망]</b> QQQ 100% 유지"
                 target_tqqq_pos = 1.0 * vol_cap
             else:
@@ -721,12 +714,45 @@ def calculate_ultra_risk_score():
         )
         target_tqqq_pos = tqqq_target_b
 
-    # 자체 로컬 DB 누적 (목표 비중까지 영구 기록)
-    db_warnings, db_total_days = update_and_verify_local_db(
-        str(qqq_d), current_close, current_tqqq, vxn_current, skew_current, total_score, target_tqqq_pos
-    )
+    # ── 자체 DB 기록 딕셔너리 생성 및 무결성 검증 ──
+    current_record = {
+        'Date': str(qqq_d),
+        'QQQ': round(current_close, 2),
+        'TQQQ': round(current_tqqq, 2),
+        'Score': round(total_score, 1),
+        'VXN': round(vxn_current, 2),
+        'SKEW': round(skew_current, 1),
+        'Term': round(vix_ratio, 2),
+        'Breadth_Z': round(z_breadth, 2),
+        'HYG_TLT': round(hyg_tlt_ratio_val, 3),
+        'PCR': round(pcr_val, 2),
+        'SOFR_BPS': round(sofr_iorb_spread_bps, 1),
+        'DXY': round(dxy_val, 2),
+        'USDJPY': round(usdjpy_val, 2),
+        'HY_Spread': round(hy_current, 2),
+        'Net_Liq': round(current_net_liq, 1),
+        'Target_Pos': round(target_tqqq_pos, 2)
+    }
+
+    db_warnings, db_total_days = update_and_verify_local_db(current_record)
     if db_warnings:
         data_warnings.extend(db_warnings)
+
+    # ── 전일 대비 변화량(Δ) 문자열 생성 ──
+    p_rec = prev_db_rec if prev_db_rec else {}
+    d_qqq = format_delta(current_close, p_rec.get('QQQ'), is_pct=True)
+    d_tqqq = format_delta(current_tqqq, p_rec.get('TQQQ'), is_pct=True)
+    d_score = format_delta(total_score, p_rec.get('Score'), unit="pt")
+    d_vxn = format_delta(vxn_current, p_rec.get('VXN'), unit="pt")
+    d_skew = format_delta(skew_current, p_rec.get('SKEW'), unit="pt")
+    d_term = format_delta(vix_ratio, p_rec.get('Term'), unit="x")
+    d_hyg_tlt = format_delta(hyg_tlt_ratio_val, p_rec.get('HYG_TLT'), is_pct=True)
+    d_pcr = format_delta(pcr_val, p_rec.get('PCR'), unit="")
+    d_sofr = format_delta(sofr_iorb_spread_bps, p_rec.get('SOFR_BPS'), unit="bp")
+    d_dxy = format_delta(dxy_val, p_rec.get('DXY'), is_pct=True)
+    d_jpy = format_delta(usdjpy_val, p_rec.get('USDJPY'), is_pct=True)
+    d_hy = format_delta(hy_current, p_rec.get('HY_Spread'), unit="%p")
+    d_liq = format_delta(current_net_liq, p_rec.get('Net_Liq'), unit="B")
 
     warning_banner = ""
     if data_warnings:
@@ -748,11 +774,11 @@ def calculate_ultra_risk_score():
         f"{warning_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
-        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b> (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b> | ATR(14): <b>{atr_pct:.2f}%</b>{vol_cap_tag}\n"
+        f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b>{d_qqq} (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
+        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b>{d_tqqq} | ATR(14): <b>{atr_pct:.2f}%</b>{vol_cap_tag}\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
-        f"🎯 <b>1단계 매크로 점수: {total_score} / 100점</b>\n"
+        f"🎯 <b>1단계 매크로 점수: {total_score} / 100점</b>{d_score}\n"
         f"⚡ <b>2단계 일봉 추세:</b> {'🔴 5일선 이탈' if below_sma5 else '🟢 5일선 지지'} | {'🔴 MACD 데드' if macd_deadcross else '🟢 MACD 상승'}\n"
         f"🌊 <b>3단계 수급/캔들:</b> {flow_status}\n"
         f"🎯 <b>4단계 목표 비중:</b> <b>TQQQ {target_tqqq_pos*100:.0f}%</b> | <b>SGOV 현금 {(1-target_tqqq_pos)*100:.0f}%</b>\n"
@@ -761,16 +787,16 @@ def calculate_ultra_risk_score():
         f"📙 <b>[TQQQ 3배수 기관급 전략 (세금/스왑/갭 방어)]</b>\n{tqqq_action}\n"
         f"{bottom_section}"
         f"────────────────\n"
-        f"📈 <b>[시장 정밀 매크로 데이터]</b>\n"
+        f"📈 <b>[시장 정밀 매크로 데이터 & 전일 대비 변화(Δ)]</b>\n"
         f"• 200일 이격: {disp_200:.1f}% ({z_disp:+.2f}σ) | RSI: {weekly_rsi:.1f}\n"
-        f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f} | <a href='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv'>기간구조</a>: {vix_ratio:.2f}\n"
+        f"• <a href='https://finance.yahoo.com/quote/%5EVXN'>VXN</a>: {vxn_current:.2f}{d_vxn} | <a href='https://finance.yahoo.com/quote/%5ESKEW'>SKEW</a>: {skew_current:.1f}{d_skew} | <a href='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv'>기간구조</a>: {vix_ratio:.2f}{d_term}\n"
         f"• <a href='https://finance.yahoo.com/quote/QQQE'>QQQ vs QQQE 쏠림</a>: {breadth_divergence:+.2f}%p (동적Z: {z_breadth:+.2f}σ)\n"
-        f"• <a href='https://finance.yahoo.com/quote/HYG'>HYG/TLT 크레딧</a>: {hyg_tlt_ratio_val:.3f} ({hyg_tlt_status})\n"
-        f"• <a href='https://finance.yahoo.com/quote/DX-Y.NYB'>DXY 달러</a>: {dxy_val:.2f} ({dxy_status}) | <a href='https://finance.yahoo.com/quote/USDJPY=X'>USD/JPY</a>: {usdjpy_val:.2f} ({usdjpy_status})\n"
-        f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{pcr_tag}\n"
-        f"• <a href='https://fred.stlouisfed.org/series/SOFR'>SOFR-IORB 스프레드</a>: <b>{sofr_iorb_spread_bps:+.1f}bp</b> ({sofr_status})\n"
-        f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{hy_tag} ({hy_status})\n"
-        f"• 순유동성: ${current_net_liq:.1f}B ({liq_change_4w:+.2f}%){liq_date_str}"
+        f"• <a href='https://finance.yahoo.com/quote/HYG'>HYG/TLT 크레딧</a>: {hyg_tlt_ratio_val:.3f}{d_hyg_tlt} ({hyg_tlt_status})\n"
+        f"• <a href='https://finance.yahoo.com/quote/DX-Y.NYB'>DXY 달러</a>: {dxy_val:.2f}{d_dxy} ({dxy_status}) | <a href='https://finance.yahoo.com/quote/USDJPY=X'>USD/JPY</a>: {usdjpy_val:.2f}{d_jpy} ({usdjpy_status})\n"
+        f"• <a href='https://www.cboe.com/us/options/market_statistics/'>Equity PCR</a>: <b>{pcr_val:.2f}</b>{d_pcr}{pcr_tag}\n"
+        f"• <a href='https://fred.stlouisfed.org/series/SOFR'>SOFR-IORB 스프레드</a>: <b>{sofr_iorb_spread_bps:+.1f}bp</b>{d_sofr} ({sofr_status})\n"
+        f"• <a href='https://fred.stlouisfed.org/series/BAMLH0A0HYM2'>HY 스프레드</a>: {hy_current:.2f}%{d_hy}{hy_tag} ({hy_status})\n"
+        f"• 순유동성: ${current_net_liq:.1f}B{d_liq} ({liq_change_4w:+.2f}%){liq_date_str}"
     )
     return report
 
