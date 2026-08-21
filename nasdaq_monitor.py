@@ -2,12 +2,36 @@ import datetime
 import os
 import re
 import io
+import time
 import requests
 import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DB_FILE = "history_db.csv"
+
+# ── 네트워크 세션 생성 (Cloudflare 차단 및 일시적 타임아웃 3회 자동 재시도) ──
+def create_retry_session():
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+    })
+    return session
+
+HTTP_SESSION = create_retry_session()
 
 def get_kst_now():
     return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
@@ -23,7 +47,6 @@ def get_last_us_trading_date():
     return d
 
 def get_previous_day_record(current_date_str):
-    """현재 날짜를 제외한 순수 '직전 거래일' 레코드 조회"""
     if os.path.exists(DB_FILE):
         try:
             db_df = pd.read_csv(DB_FILE)
@@ -39,7 +62,6 @@ def get_previous_day_record(current_date_str):
     return None, 0
 
 def update_and_verify_local_db(record_dict):
-    """[자체 DB 자동 치유 엔진] 확정 종가 정산 시 DB 자동 갱신 및 무결성 유지"""
     warnings = []
     cols = list(record_dict.keys())
     
@@ -55,13 +77,9 @@ def update_and_verify_local_db(record_dict):
     date_str = str(record_dict['Date'])
     if date_str in db_df['Date'].values:
         idx = db_df[db_df['Date'] == date_str].index[-1]
-        past_val = float(db_df.loc[idx, 'QQQ'])
-        curr_val = float(record_dict['QQQ'])
-        if abs(past_val - curr_val) > 0.05:
-            # 확정 종가로 DB 자동 치유(Auto-Update)
-            for k, v in record_dict.items():
-                db_df.loc[idx, k] = v
-            db_df.to_csv(DB_FILE, index=False)
+        for k, v in record_dict.items():
+            db_df.loc[idx, k] = v
+        db_df.to_csv(DB_FILE, index=False)
     else:
         new_row = pd.DataFrame([record_dict])
         db_df = pd.concat([db_df, new_row], ignore_index=True)
@@ -71,11 +89,31 @@ def update_and_verify_local_db(record_dict):
 
     return warnings, len(db_df)
 
+def check_fomc_event_risk(target_date):
+    """FOMC 금리 결정 당일 및 D-1 이벤트 위험 감지"""
+    # 2026년 공식 FOMC 발표일 (현지시간 기준)
+    fomc_dates_2026 = [
+        datetime.date(2026, 1, 28),
+        datetime.date(2026, 3, 18),
+        datetime.date(2026, 5, 6),
+        datetime.date(2026, 6, 17),
+        datetime.date(2026, 7, 29),
+        datetime.date(2026, 9, 16),
+        datetime.date(2026, 11, 4),
+        datetime.date(2026, 12, 16)
+    ]
+    for fd in fomc_dates_2026:
+        delta_days = (fd - target_date).days
+        if delta_days == 0:
+            return "🔥 <b>[FOMC 금리결정 발표 당일]</b> 변동성 확대 대비 레버리지 신규 매수 유예"
+        elif delta_days == 1:
+            return "⚠️ <b>[FOMC D-1 경계 구간]</b> 금리 결정 앞두고 관망 심리 고조 (포지션 보수적 운용)"
+    return None
+
 def fetch_yahoo_v8_chart(ticker_symbol):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2y&interval=1d"
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
             result = data['chart']['result'][0]
@@ -107,7 +145,6 @@ def fetch_yahoo_v8_chart(ticker_symbol):
     return None, 0.0, None, True
 
 def fetch_stooq_csv(ticker_symbol):
-    headers = {'User-Agent': 'Mozilla/5.0'}
     symbol_map = {
         "QQQ": "qqq", "TQQQ": "tqqq", "QQQE": "qqqe", "HYG": "hyg", "TLT": "tlt",
         "^VIX": "^vix", "^VXN": "^vxn", "^VIX1D": "^vix1d", "^SKEW": "^skew", "NQ=F": "nq.f",
@@ -116,7 +153,7 @@ def fetch_stooq_csv(ticker_symbol):
     stooq_sym = symbol_map.get(ticker_symbol, ticker_symbol.lower())
     url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200 and len(res.text) > 50 and "No data" not in res.text:
             df = pd.read_csv(io.StringIO(res.text))
             if 'Date' in df.columns and 'Close' in df.columns:
@@ -155,10 +192,9 @@ def fetch_cross_validated_data(ticker_symbol, expected_trading_date):
     return chosen_df, chosen_p, chosen_d, warning_msg
 
 def fetch_overnight_futures_gap():
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?range=2d&interval=5m"
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
             result = data['chart']['result'][0]
@@ -174,9 +210,8 @@ def fetch_overnight_futures_gap():
 
 def fetch_vix3m_real():
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200:
             lines = res.text.splitlines()
             data = []
@@ -210,7 +245,7 @@ def fetch_fred_api(series_id, api_key):
                 "sort_order": "desc",
                 "limit": 100
             }
-            res = requests.get(url, params=params, timeout=10)
+            res = HTTP_SESSION.get(url, params=params, timeout=10)
             data = res.json()
             if "observations" in data and data["observations"]:
                 records = []
@@ -229,9 +264,8 @@ def fetch_fred_api(series_id, api_key):
             print(f"FRED API 에러 ({series_id}): {e}")
 
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        res = requests.get(csv_url, headers=headers, timeout=10)
+        res = HTTP_SESSION.get(csv_url, timeout=10)
         if res.status_code == 200 and len(res.text) > 30:
             df = pd.read_csv(io.StringIO(res.text))
             df.columns = [c.strip().upper() for c in df.columns]
@@ -247,10 +281,9 @@ def fetch_fred_api(series_id, api_key):
     return None, None, True
 
 def fetch_equity_pcr():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url = "https://www.cboe.com/us/options/market_statistics/daily/"
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=10)
         if res.status_code == 200:
             match = re.search(r'Equity\s+(?:Put/Call|P/C)\s+Ratio[^\d]*([0-1]\.\d{2,3})', res.text, re.IGNORECASE)
             if match:
@@ -262,7 +295,7 @@ def fetch_equity_pcr():
 
     try:
         url_csv = "https://cdn.cboe.com/data/us/options/market_statistics/daily/daily_market_statistics.csv"
-        res_csv = requests.get(url_csv, headers=headers, timeout=8)
+        res_csv = HTTP_SESSION.get(url_csv, timeout=10)
         if res_csv.status_code == 200:
             lines = res_csv.text.splitlines()
             for line in lines:
@@ -281,7 +314,6 @@ def fetch_equity_pcr():
     return 0.58, True
 
 def format_delta(current, prev, is_pct=False, unit="", decimals=2):
-    """전일 대비 변화량(Δ) 정밀 포맷팅"""
     if prev is None or (isinstance(prev, float) and np.isnan(prev)):
         return " (기록시작)"
     try:
@@ -311,6 +343,9 @@ def calculate_ultra_risk_score():
     regime_alerts = []
 
     expected_trading_date = get_last_us_trading_date()
+
+    # FOMC 이벤트 리스크 체크
+    fomc_banner_text = check_fomc_event_risk(expected_trading_date)
 
     # 1. 시세 및 변동성 수집
     qqq_df, current_close, qqq_d, w_qqq = fetch_cross_validated_data("QQQ", expected_trading_date)
@@ -783,7 +818,7 @@ def calculate_ultra_risk_score():
         'Target_Pos': round(target_tqqq_pos, 2)
     }
 
-    # 직전 거래일 레코드 조회 (현재일 이전 레코드 기준)
+    # 직전 거래일 레코드 조회
     prev_db_rec, db_total_days = get_previous_day_record(str(qqq_d))
 
     # 자체 DB 갱신 및 자동 치유
@@ -811,6 +846,10 @@ def calculate_ultra_risk_score():
     if data_warnings:
         warning_banner = "🚨 <b>[데이터 품질/수집 경보]</b>\n" + "\n".join([f"• {w}" for w in data_warnings]) + "\n────────────────\n"
 
+    fomc_banner = ""
+    if fomc_banner_text:
+        fomc_banner = f"{fomc_banner_text}\n────────────────\n"
+
     regime_banner = ""
     if regime_alerts:
         regime_banner = (
@@ -825,6 +864,7 @@ def calculate_ultra_risk_score():
         f"📊 <b>[나스닥 1배·2배·3배 4단계 정밀 판독기 (MDD 최적화)]</b>\n"
         f"📅 기준(KST): {kst_now_str} (자체DB: {db_total_days}일 누적)\n\n"
         f"{warning_banner}"
+        f"{fomc_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
         f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b>{d_qqq} (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
@@ -871,11 +911,18 @@ def send_telegram_message(text):
         "disable_web_page_preview": True
     }
     try:
-        res = requests.post(url, data=payload, timeout=10)
+        res = HTTP_SESSION.post(url, data=payload, timeout=10)
         if res.status_code == 200:
             print("텔레그램 전송 성공!")
         else:
             print(f"텔레그램 전송 실패: {res.status_code}, {res.text}")
+            # HTML 파싱 에러 시 일반 텍스트로 안전 2차 전송 시도
+            if "can't parse entities" in res.text:
+                plain_text = re.sub(r'<[^>]+>', '', text)
+                payload["text"] = plain_text
+                payload.pop("parse_mode", None)
+                HTTP_SESSION.post(url, data=payload, timeout=10)
+                print("일반 텍스트 대체 전송 완료!")
     except Exception as e:
         print(f"텔레그램 통신 오류: {e}")
 
