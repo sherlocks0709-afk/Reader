@@ -1,7 +1,7 @@
 name: Nasdaq QQQ Daily Ultra Monitor
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 외부 정시 스케줄러 트리거 및 수동 실행
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ jobs:
 
       - name: 패키지 설치
         run: |
-          pip install requests pandas numpy
+          pip install requests pandas numpy urllib3
 
       - name: 모니터링 실행 및 자체 DB 누적
         env:
