@@ -22,17 +22,24 @@ def get_last_us_trading_date():
         d -= datetime.timedelta(days=1)
     return d
 
-def get_previous_day_record():
+def get_previous_day_record(current_date_str):
+    """현재 날짜를 제외한 순수 '직전 거래일' 레코드 조회"""
     if os.path.exists(DB_FILE):
         try:
             db_df = pd.read_csv(DB_FILE)
             if not db_df.empty:
-                return db_df.iloc[-1].to_dict(), len(db_df)
+                db_df['Date'] = db_df['Date'].astype(str)
+                past_df = db_df[db_df['Date'] < current_date_str]
+                if not past_df.empty:
+                    return past_df.iloc[-1].to_dict(), len(db_df)
+                else:
+                    return None, len(db_df)
         except Exception:
             pass
     return None, 0
 
 def update_and_verify_local_db(record_dict):
+    """[자체 DB 자동 치유 엔진] 확정 종가 정산 시 DB 자동 갱신 및 무결성 유지"""
     warnings = []
     cols = list(record_dict.keys())
     
@@ -47,9 +54,14 @@ def update_and_verify_local_db(record_dict):
 
     date_str = str(record_dict['Date'])
     if date_str in db_df['Date'].values:
-        past_row = db_df[db_df['Date'] == date_str].iloc[-1]
-        if abs(float(past_row['QQQ']) - float(record_dict['QQQ'])) > 0.05:
-            warnings.append(f"🚨 [DB 불일치] {date_str} 저장 종가(${past_row['QQQ']}) vs 수집 종가(${record_dict['QQQ']:.2f})")
+        idx = db_df[db_df['Date'] == date_str].index[-1]
+        past_val = float(db_df.loc[idx, 'QQQ'])
+        curr_val = float(record_dict['QQQ'])
+        if abs(past_val - curr_val) > 0.05:
+            # 확정 종가로 DB 자동 치유(Auto-Update)
+            for k, v in record_dict.items():
+                db_df.loc[idx, k] = v
+            db_df.to_csv(DB_FILE, index=False)
     else:
         new_row = pd.DataFrame([record_dict])
         db_df = pd.concat([db_df, new_row], ignore_index=True)
@@ -268,7 +280,8 @@ def fetch_equity_pcr():
 
     return 0.58, True
 
-def format_delta(current, prev, is_pct=False, unit=""):
+def format_delta(current, prev, is_pct=False, unit="", decimals=2):
+    """전일 대비 변화량(Δ) 정밀 포맷팅"""
     if prev is None or (isinstance(prev, float) and np.isnan(prev)):
         return " (기록시작)"
     try:
@@ -281,16 +294,16 @@ def format_delta(current, prev, is_pct=False, unit=""):
         if p_val == 0:
             return " (전일동일)"
         pct_chg = ((c_val / p_val) - 1) * 100
-        if abs(round(pct_chg, 2)) == 0.0:
+        if abs(round(pct_chg, decimals)) == 0.0:
             return " (전일동일)"
         sign = "+" if pct_chg > 0 else ""
-        return f" (Δ {sign}{pct_chg:.2f}%)"
+        return f" (Δ {sign}{pct_chg:.{decimals}f}%)"
     else:
         diff = c_val - p_val
-        if abs(round(diff, 2)) == 0.0:
+        if abs(round(diff, decimals)) == 0.0:
             return " (전일동일)"
         sign = "+" if diff > 0 else ""
-        return f" (Δ {sign}{diff:.2f}{unit})"
+        return f" (Δ {sign}{diff:.{decimals}f}{unit})"
 
 def calculate_ultra_risk_score():
     fred_api_key = os.environ.get("FRED_API_KEY", "")
@@ -298,7 +311,6 @@ def calculate_ultra_risk_score():
     regime_alerts = []
 
     expected_trading_date = get_last_us_trading_date()
-    prev_db_rec, db_total_days = get_previous_day_record()
 
     # 1. 시세 및 변동성 수집
     qqq_df, current_close, qqq_d, w_qqq = fetch_cross_validated_data("QQQ", expected_trading_date)
@@ -365,12 +377,12 @@ def calculate_ultra_risk_score():
     sma5 = float(sma5_s.iloc[-1])
     sma20 = float(sma20_s.iloc[-1])
     sma20_prev5 = float(sma20_s.iloc[-6]) if len(sma20_s) >= 6 else sma20
-    sma20_slope = ((sma20 / sma20_prev5) - 1) * 100 # 20일선 5일간 기울기(%)
+    sma20_slope = ((sma20 / sma20_prev5) - 1) * 100
 
     sma50 = float(sma50_s.iloc[-1])
     sma200 = float(sma200_s.iloc[-1])
     disp_200 = float(disp200_s.iloc[-1])
-    disp_20 = (current_close / sma20) * 100 # [보완②] 20일선 단기 이격도
+    disp_20 = (current_close / sma20) * 100
     bb_width = float(bb_width_s.iloc[-1])
 
     is_ranging_market = (bb_width <= 4.0)
@@ -426,7 +438,7 @@ def calculate_ultra_risk_score():
     score_term = float(np.clip((vix_ratio - 0.80) * (6.0 / 0.20), 0, 6.0))
     term_status = "🚨 백워데이션" if vix_ratio >= 1.0 else "🟢 콘탱고 (안정)"
 
-    # 1-6. [보완①] QQQ vs QQQE 쏠림 동적 Z + 시장 참여폭 (8.0점)
+    # 1-6. QQQ vs QQQE 쏠림 (8.0점)
     score_breadth = 0.0
     breadth_divergence = 0.0
     z_breadth = 0.0
@@ -614,7 +626,6 @@ def calculate_ultra_risk_score():
         vol_cap = 0.75
         vol_cap_tag = f" (🔥고변동성 장세 ATR {atr_pct:.1f}% ➔ 기본 비중 75% 캡 제한)"
 
-    # [보완②] 20일 이격 과열 클라이맥스 (disp_20 >= 108%) 선제 15% 익절
     is_climax_run = (disp_20 >= 108.0)
     climax_tag = ""
     if is_climax_run and total_score < 65:
@@ -707,7 +718,6 @@ def calculate_ultra_risk_score():
         if not below_sma5: b_score += 25.0
         if not macd_deadcross: b_score += 25.0
 
-        # 데드캣 바운스(SMA20 급락 중) 감지 시 레버리지 진입 속도 조절
         is_deadcat_risk = (sma20_slope <= -1.5)
         deadcat_tag = " (⚠️20일선 하향 기울기 지속 ➔ 레버리지 50% 캡 제한)" if is_deadcat_risk else ""
 
@@ -753,7 +763,7 @@ def calculate_ultra_risk_score():
             f"📙 <b>[미국 TQQQ 3배수 바닥 지침]</b>\n{tqqq_b_action}\n"
         )
 
-    # ── 자체 DB 기록 ──
+    # ── 자체 DB 레코드 생성 ──
     current_record = {
         'Date': str(qqq_d),
         'QQQ': round(current_close, 2),
@@ -773,25 +783,29 @@ def calculate_ultra_risk_score():
         'Target_Pos': round(target_tqqq_pos, 2)
     }
 
+    # 직전 거래일 레코드 조회 (현재일 이전 레코드 기준)
+    prev_db_rec, db_total_days = get_previous_day_record(str(qqq_d))
+
+    # 자체 DB 갱신 및 자동 치유
     db_warnings, db_total_days = update_and_verify_local_db(current_record)
     if db_warnings:
         data_warnings.extend(db_warnings)
 
     # ── 전일 대비 변화량(Δ) 생성 ──
     p_rec = prev_db_rec if prev_db_rec else {}
-    d_qqq = format_delta(current_close, p_rec.get('QQQ'), is_pct=True)
-    d_tqqq = format_delta(current_tqqq, p_rec.get('TQQQ'), is_pct=True)
-    d_score = format_delta(total_score, p_rec.get('Score'), unit="pt")
-    d_vxn = format_delta(vxn_current, p_rec.get('VXN'), unit="pt")
-    d_skew = format_delta(skew_current, p_rec.get('SKEW'), unit="pt")
-    d_term = format_delta(vix_ratio, p_rec.get('Term'), unit="x")
-    d_hyg_tlt = format_delta(hyg_tlt_ratio_val, p_rec.get('HYG_TLT'), is_pct=True)
-    d_pcr = format_delta(pcr_val, p_rec.get('PCR'), unit="")
-    d_sofr = format_delta(sofr_iorb_spread_bps, p_rec.get('SOFR_BPS'), unit="bp")
-    d_dxy = format_delta(dxy_val, p_rec.get('DXY'), is_pct=True)
-    d_jpy = format_delta(usdjpy_val, p_rec.get('USDJPY'), is_pct=True)
-    d_hy = format_delta(hy_current, p_rec.get('HY_Spread'), unit="%p")
-    d_liq = format_delta(current_net_liq, p_rec.get('Net_Liq'), unit="B")
+    d_qqq = format_delta(current_close, p_rec.get('QQQ'), is_pct=True, decimals=2)
+    d_tqqq = format_delta(current_tqqq, p_rec.get('TQQQ'), is_pct=True, decimals=2)
+    d_score = format_delta(total_score, p_rec.get('Score'), unit="pt", decimals=1)
+    d_vxn = format_delta(vxn_current, p_rec.get('VXN'), unit="pt", decimals=2)
+    d_skew = format_delta(skew_current, p_rec.get('SKEW'), unit="pt", decimals=1)
+    d_term = format_delta(vix_ratio, p_rec.get('Term'), unit="x", decimals=2)
+    d_hyg_tlt = format_delta(hyg_tlt_ratio_val, p_rec.get('HYG_TLT'), is_pct=True, decimals=2)
+    d_pcr = format_delta(pcr_val, p_rec.get('PCR'), unit="", decimals=2)
+    d_sofr = format_delta(sofr_iorb_spread_bps, p_rec.get('SOFR_BPS'), unit="bp", decimals=1)
+    d_dxy = format_delta(dxy_val, p_rec.get('DXY'), is_pct=True, decimals=2)
+    d_jpy = format_delta(usdjpy_val, p_rec.get('USDJPY'), is_pct=True, decimals=2)
+    d_hy = format_delta(hy_current, p_rec.get('HY_Spread'), unit="%p", decimals=2)
+    d_liq = format_delta(current_net_liq, p_rec.get('Net_Liq'), unit="B", decimals=1)
 
     warning_banner = ""
     if data_warnings:
