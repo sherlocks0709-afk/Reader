@@ -88,7 +88,6 @@ class LiveMarketDataCollector:
         return pd.DataFrame()
 
     def fetch_fred_liquidity(self) -> tuple:
-        """FRED TGA/RRP 수집 (성공 시 float, 실패 시 None)"""
         tga, rrp = None, None
         try:
             url_tga = (
@@ -115,7 +114,6 @@ class LiveMarketDataCollector:
         return tga, rrp
 
     def fetch_cboe_equity_pcr(self) -> float:
-        """CBOE 공식 Equity PCR 수집 (실패 시 None)"""
         try:
             url = "https://cdn.cboe.com/data/us/options/market_statistics/daily/current_market_statistics.csv"
             res = requests.get(url, timeout=7)
@@ -133,17 +131,13 @@ class LiveMarketDataCollector:
 # 3. 고정밀 대체재(Proxy) 산출 엔진
 # -------------------------------------------------------------
 def estimate_proxy_equity_pcr(qqq_df, vxn_val, prev_pcr=None) -> float:
-    """CBOE 결측 시 QQQ 수급 압력과 VXN으로 Equity PCR 정밀 추정 (정밀도 94%)"""
     if not qqq_df.empty:
         c, h, l = (
             float(qqq_df["Close"].iloc[-1]),
             float(qqq_df["High"].iloc[-1]),
             float(qqq_df["Low"].iloc[-1]),
         )
-        clv = (
-            ((c - l) - (h - c)) / (h - l) if (h > l) else 0.0
-        )  # Close Location Value (-1 ~ +1)
-        # 패닉성 매도(하락 마감) 시 PCR 상승 추정
+        clv = ((c - l) - (h - c)) / (h - l) if (h > l) else 0.0
         skew_est = 0.65 - (clv * 0.20) + max(0.0, (vxn_val - 20.0) * 0.015)
         return round(float(np.clip(skew_est, 0.45, 1.45)), 2)
     return float(prev_pcr) if prev_pcr else 0.65
@@ -157,7 +151,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
     collector = LiveMarketDataCollector()
     warnings = []
 
-    # 1. 야후 파이낸스 기본 수집
     qqq_df = collector.fetch_yahoo_df("QQQ")
     vix_df = collector.fetch_yahoo_df("^VIX")
     vix1d_df = collector.fetch_yahoo_df("^VIX1D")
@@ -195,7 +188,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         float(vxn_df["Close"].iloc[-1]) if not vxn_df.empty else 20.0
     )
 
-    # VIX1D 합성 복원 (결측 여부 트래킹)
     vix1d_is_proxy = False
     if not vix1d_df.empty and "Close" in vix1d_df.columns:
         vix1d_val = float(vix1d_df["Close"].iloc[-1])
@@ -235,7 +227,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         round(float(hyg_val / tlt_val), 3) if tlt_val != 0 else 0.83
     )
 
-    # 2. FRED 유동성 수집 & 결측 방어
     tga_raw, rrp_raw = collector.fetch_fred_liquidity()
     if tga_raw is None:
         warnings.append("TGA 잔고 (DB 계승)")
@@ -257,7 +248,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
     else:
         rrp_level = rrp_raw
 
-    # 3. CBOE Equity PCR 수집 & Proxy 대체
     pcr_raw = collector.fetch_cboe_equity_pcr()
     pcr_is_proxy = False
     if pcr_raw is None:
@@ -270,7 +260,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
     else:
         pcr_val = pcr_raw
 
-    # 4. 선물 베이시스
     basis_is_proxy = False
     if not nq_df.empty:
         nq_close = float(nq_df["Close"].iloc[-1])
@@ -284,7 +273,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
             float(0.04 + (tnx_val * 0.01) + (qqq_ret_1d * 0.02)), 2
         )
 
-    # 5. 스코어링 (0~100)
     disparity_stress = max(0.0, -disparity_60) * 4.0
     rate_stress = max(0.0, tnx_roc5) * 3.0
     credit_stress = max(0.0, (0.9 - hyg_tlt_ratio)) * 40.0
@@ -362,7 +350,7 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 6. 포맷터 및 브리핑 발송 (데이터 건전성 배너 탑재)
+# 6. 포맷터 및 브리핑 발송 (40/50/10 Core-Satellite 모델 적용)
 # -------------------------------------------------------------
 def is_valid_num(val):
     if val is None:
@@ -384,7 +372,7 @@ def fmt_row(label: str, curr, prev, unit="", is_rate=False, is_proxy=False) -> s
     curr_f = float(curr)
     val_str = f"{curr_f:.2f}{unit}" if is_rate else f"{curr_f}{unit}"
     if is_proxy:
-        val_str += "*"  # 대체재 표기
+        val_str += "*"
 
     if prev_valid:
         diff = curr_f - float(prev)
@@ -400,6 +388,8 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
     macro_score = data["Macro_Score"]
     vol_score = data["Vol_Score"]
     vix1d = data["VIX1D"]
+    disparity = data["Disparity_60"]
+    hv5 = data["HV5"]
 
     vix1d_prev = (
         float(prev["VIX1D"])
@@ -418,54 +408,58 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
 
     vix1d_turned = (vix1d_prev >= 35.0) and (vix1d < vix1d_prev)
     pcr_turned = (pcr_prev >= 1.00) and (pcr < pcr_prev)
+    early_exit_triggered = (hv5 >= 22.0 and vix1d >= 24.0) or (
+        disparity <= 1.0 and vix1d >= 22.0
+    )
+    panic_oversold = (vix1d >= 45.0) or (disparity <= -6.5 and vix1d >= 30.0)
 
-    if macro_score >= 50.0 and vol_score >= 45.0:
-        if macro_score >= 65.0 and vix1d >= 40.0:
-            header_icon = "🚨"
-            status_title = "극단적 위기 (인버스 헤지 발동)"
-            us_guide = "QQQ 0% | SGOV 50% | SH 50%"
-            kr_guide = "국내 나스닥 0% | 달러SOFR 100%"
-            action_desc = (
-                "대세 하락 패닉. 주식 전량 매도 및 SH 인버스 헤지 편입."
-            )
-        else:
-            header_icon = "⚠️"
-            status_title = "위험 경보 (안전자산 대기)"
-            us_guide = "QQQ 0% | SGOV 100% | SH 0%"
-            kr_guide = "국내 나스닥 0% | 달러SOFR 100%"
-            action_desc = (
-                "스트레스 가중. 전량 매도 후 초단기채(SGOV)로 안전 대기."
-            )
-
-    elif vix1d_turned:
+    # 1. 저점 스나이핑 1차 (TQQQ 20% 진입)
+    if vix1d_turned:
         header_icon = "⚡"
-        status_title = "저점 매수 1차 (미국 TQQQ 스나이핑)"
-        us_guide = "TQQQ 30% | QQQ 30% | SGOV 40%"
-        kr_guide = "국내 나스닥 40% | 달러SOFR 60%"
-        action_desc = f"VIX1D({vix1d_prev:.2f} → {vix1d:.2f}) 피크아웃. 미국 TQQQ 30% 바닥 1차 선진입."
+        status_title = "저점 매수 1차 (TQQQ 20% 스나이핑)"
+        us_guide = "Core QQQ 40% | Satellite QQQ 40% + TQQQ 10% | Sniping TQQQ 10%\n  (총합: QQQ 80% | TQQQ 20% | SGOV 0%)"
+        kr_guide = "Core 나스닥 40% | Satellite 나스닥 40% | 달러레버리지 20%"
+        action_desc = f"VIX1D({vix1d_prev:.2f} → {vix1d:.2f}) 피크아웃. TQQQ 20% 바닥 1차 선진입."
 
-    elif pcr_turned and macro_score < 55.0:
+    # 2. 저점 스나이핑 2차 (TQQQ 40% 확대)
+    elif pcr_turned and macro_score < 60.0:
         header_icon = "🚀"
-        status_title = "저점 매수 2차 (반등 탄력 확대)"
-        us_guide = "TQQQ 30% | QQQ 50% | SGOV 20%"
-        kr_guide = "국내 나스닥 80% | 달러SOFR 20%"
-        action_desc = f"Equity PCR({pcr_prev:.2f} → {pcr:.2f}) 공포 완화 확인. QQQ 비중 추가 확대."
+        status_title = "저점 매수 2차 (TQQQ 40% 풀스나이핑)"
+        us_guide = "Core QQQ 40% | Satellite QQQ 20% + TQQQ 30% | Sniping TQQQ 10%\n  (총합: QQQ 60% | TQQQ 40% | SGOV 0%)"
+        kr_guide = "Core 나스닥 40% | Satellite 나스닥 20% | 달러레버리지 40%"
+        action_desc = f"Equity PCR({pcr_prev:.2f} → {pcr:.2f}) 공포 완화 확인. TQQQ 비중 40% 극대화."
 
-    elif prev_macro >= 50.0 and macro_score >= 42.0:
+    # 3. 투매 절정 구간 (매도 금지)
+    elif panic_oversold:
+        header_icon = "🛡️"
+        status_title = "투매 절정 구간 (바닥 손절 금지 / 반등 대기)"
+        us_guide = "Core QQQ 40% 유지 | Satellite SGOV 50% | Sniping SGOV 10%\n  (신규 매도 금지 / VIX1D 꺾임 대기)"
+        kr_guide = "Core 나스닥 40% 유지 | SGOV/SOFR 60% (매도 금지)"
+        action_desc = f"단기 패닉 극단치(VIX1D {vix1d:.2f}). 최저점 손절을 차단하고 VIX1D 꺾임 신호 대기."
+
+    # 4. 위험 경보 (Satellite 50% + Sniping 10% 전량 SGOV 대피)
+    elif (macro_score >= 48.0 and vol_score >= 40.0) or early_exit_triggered:
+        header_icon = "⚠️"
+        status_title = "위험 경보 (안전자산 60% 대피)"
+        us_guide = "Core QQQ 40% 유지 | Satellite SGOV 50% | Sniping SGOV 10%\n  (총합: QQQ 40% | SGOV 60%)"
+        kr_guide = "Core 나스닥 40% 유지 | 달러SOFR 60%"
+        action_desc = "단기 변동성 및 매크로 스트레스 급등. Core 40% 유지 후 60% SGOV 대피."
+
+    # 5. 휩쏘 방지 버퍼
+    elif prev_macro >= 48.0 and macro_score >= 40.0:
         header_icon = "⏳"
         status_title = "재진입 대기 (휩쏘 방지 안착 관망)"
-        us_guide = "QQQ 0% | SGOV 100% | SH 0%"
-        kr_guide = "국내 나스닥 0% | 달러SOFR 100%"
-        action_desc = (
-            f"매크로 점수({macro_score}/100) 안정화 대기. 42점 이하 안착 시 재진입."
-        )
+        us_guide = "Core QQQ 40% 유지 | Satellite SGOV 50% | Sniping SGOV 10%\n  (총합: QQQ 40% | SGOV 60%)"
+        kr_guide = "Core 나스닥 40% 유지 | 달러SOFR 60%"
+        action_desc = f"매크로 점수({macro_score}/100) 안정화 대기. 40점 이하 안착 시 QQQ 90% 복귀."
 
+    # 6. 정상 운용 (Risk-On)
     else:
         header_icon = "✅"
-        status_title = "정상 운용 (Risk-On / 1배수 유지)"
-        us_guide = "QQQ 100% | TQQQ 0% | SGOV 0%"
-        kr_guide = "국내 나스닥(1배) 100%"
-        action_desc = "지표 안정권 안착. QQQ 1배수 100% 보유 유지 (TQQQ 자동 롤오버 완료)."
+        status_title = "정상 운용 (Risk-On / QQQ 90% 유지)"
+        us_guide = "Core QQQ 40% | Satellite QQQ 50% | Sniping SGOV 10%\n  (총합: QQQ 90% | SGOV 10%)"
+        kr_guide = "Core 나스닥 40% | Satellite 나스닥 50% | 달러SOFR 10%"
+        action_desc = "지표 안정권. QQQ 90% 보유 유지 + 현금 10% SGOV 이자 수취."
 
     prev_date_str = (
         f"vs {prev['Date']}"
@@ -474,12 +468,12 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
     )
     p_d = prev if prev else {}
 
-    # 데이터 건전성 경고 배너
     warnings = data.get("Warnings", [])
-    if warnings:
-        warn_banner = f"⚠️ <b>[데이터 알림] {len(warnings)}개 지표 대체재(*) 가동</b>\n<i>({', '.join(warnings)})</i>\n━━━━━━━━━━━━━━━━━━\n"
-    else:
-        warn_banner = ""
+    warn_banner = (
+        f"⚠️ <b>[데이터 알림] {len(warnings)}개 지표 대체재(*) 가동</b>\n<i>({', '.join(warnings)})</i>\n━━━━━━━━━━━━━━━━━━\n"
+        if warnings
+        else ""
+    )
 
     tga_s = (
         f"${data['TGA_Level']}B"
@@ -521,9 +515,12 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
 • TGA / RRP 잔고   : <code>{tga_s} / {rrp_s}</code>
 
 ━━━━━━━━━━━━━━━━━━
-🎯 <b>목표 포트폴리오 비중</b>
-🇺🇸 <b>미국 직투:</b> <code>{us_guide}</code>
-🇰🇷 <b>국내 계좌:</b> <code>{kr_guide}</code>
+🎯 <b>목표 포트폴리오 비중 (Core-Satellite)</b>
+🇺🇸 <b>미국 직투:</b>
+<code>{us_guide}</code>
+
+🇰🇷 <b>국내 계좌:</b>
+<code>{kr_guide}</code>
 
 💡 <b>운용 가이드:</b>
 <i>{action_desc}</i>
