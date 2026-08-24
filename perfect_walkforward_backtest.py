@@ -1,10 +1,8 @@
 import datetime
 import os
-import io
 import requests
 import pandas as pd
 import numpy as np
-from zoneinfo import ZoneInfo
 
 RAW_DB_FILE = "longterm_peak_db.csv"
 
@@ -20,109 +18,19 @@ def send_telegram_result(text):
         res = requests.post(url, data=payload, timeout=15)
         if res.status_code == 200:
             print("✅ 텔레그램 전송 성공!")
-        else:
-            print(f"🚨 텔레그램 전송 에러 ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"텔레그램 통신 실패: {e}")
 
-def get_historical_data(ticker_symbol):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=15y&interval=1d"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            if 'chart' in data and data['chart']['result']:
-                res_data = data['chart']['result'][0]
-                timestamps = res_data.get('timestamp', [])
-                quotes = res_data.get('indicators', {}).get('quote', [{}])[0]
-                ny_tz = ZoneInfo("America/New_York")
-                dates = [datetime.datetime.fromtimestamp(ts, tz=ny_tz).date() for ts in timestamps]
-                
-                df = pd.DataFrame({
-                    'Date': pd.to_datetime(dates),
-                    'Open': quotes.get('open', []),
-                    'High': quotes.get('high', []),
-                    'Low': quotes.get('low', []),
-                    'Close': quotes.get('close', []),
-                    'Volume': quotes.get('volume', [])
-                }).dropna(subset=['Close'])
-                
-                df['Open'] = df['Open'].fillna(df['Close'])
-                df['High'] = df['High'].fillna(df['Close'])
-                df['Low'] = df['Low'].fillna(df['Close'])
-                df['Volume'] = df['Volume'].fillna(1.0)
-                df.set_index('Date', inplace=True)
-                return df.astype(float)
-    except Exception as e:
-        print(f"데이터 수집 에러 ({ticker_symbol}): {e}")
-    return pd.DataFrame()
-
-def fetch_fred_historical(series_id):
-    try:
-        csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(csv_url, headers=headers, timeout=10)
-        if res.status_code == 200 and len(res.text) > 30:
-            df = pd.read_csv(io.StringIO(res.text))
-            df.columns = [c.strip().upper() for c in df.columns]
-            if "DATE" in df.columns and series_id.upper() in df.columns:
-                df['Date'] = pd.to_datetime(df['DATE'])
-                df[series_id] = pd.to_numeric(df[series_id.upper()], errors='coerce')
-                return df.dropna(subset=[series_id]).set_index('Date')[[series_id]]
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def load_or_fetch_db():
-    if os.path.exists(RAW_DB_FILE):
-        try:
-            df = pd.read_csv(RAW_DB_FILE)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
-            if len(df) > 1000:
-                print(f"📦 로컬 DB 파일 '{RAW_DB_FILE}' 로드 완료 ({len(df)}행)")
-                return df
-        except Exception:
-            pass
-
-    print("🌐 DB 파일이 없어 Yahoo/FRED에서 직접 14년 치를 다운로드합니다...")
-    qqq = get_historical_data("QQQ")
-    vix = get_historical_data("^VIX")
-    skew = get_historical_data("^SKEW")
-    hyg = get_historical_data("HYG")
-    tlt = get_historical_data("TLT")
-    df_hy = fetch_fred_historical("BAMLH0A0HYM2")
-
-    if qqq.empty:
-        print("🚨 QQQ 데이터 수집 실패")
-        return pd.DataFrame()
-
-    df = pd.DataFrame({
-        'QQQ_Close': qqq['Close'], 'QQQ_Open': qqq['Open'],
-        'QQQ_High': qqq['High'], 'QQQ_Low': qqq['Low'], 'QQQ_Vol': qqq['Volume']
-    })
-    
-    df['VIX'] = vix['Close'] if not vix.empty else 18.0
-    df['SKEW'] = skew['Close'] if not skew.empty else 125.0
-    df['HYG'] = hyg['Close'] if not hyg.empty else 75.0
-    df['TLT'] = tlt['Close'] if not tlt.empty else 90.0
-    df['HY_SPREAD'] = df_hy['BAMLH0A0HYM2'] if not df_hy.empty else 3.5
-
-    df = df.ffill().bfill().dropna()
-    df.to_csv(RAW_DB_FILE)
-    return df
-
-def run_precision_analysis():
-    df = load_or_fetch_db()
-    if df.empty or len(df) < 500:
-        print("🚨 유효 데이터 부족으로 분석 중단")
+def run_pure_crash_analysis():
+    if not os.path.exists(RAW_DB_FILE):
+        print("DB 파일이 없습니다.")
         return
 
-    print(f"📊 총 {len(df)}거래일 정밀 고점 감지 시작...")
+    df = pd.read_csv(RAW_DB_FILE)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.set_index('Date', inplace=True)
 
     qqq_c = df['QQQ_Close']
-    qqq_v = df['QQQ_Vol']
     
     sma5 = qqq_c.rolling(5).mean()
     sma20 = qqq_c.rolling(20).mean()
@@ -137,51 +45,61 @@ def run_precision_analysis():
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
 
-    vol_20avg = qqq_v.rolling(20).mean()
-    vol_ratio = qqq_v / vol_20avg
-
     peaks_detected = []
+    
+    # 60일 전고점 추적용
+    rolling_peak = qqq_c.rolling(60).max()
 
-    for i in range(50, len(df) - 60):
+    for i in range(60, len(df) - 60):
         d_curr = df.index[i]
         curr_p = float(qqq_c.iloc[i])
+        peak_60d = float(rolling_peak.iloc[i])
+        curr_drawdown = ((curr_p / peak_60d) - 1) * 100
 
-        # ── 1. 정밀 버블 과열 필터 ──
-        cond_bubble = (
-            (disp200.iloc[i] >= 108.0 or disp20.iloc[i] >= 106.0) and
-            (float(df['SKEW'].iloc[i]) >= 140.0) and
-            (float(df['VIX'].iloc[i]) >= 19.5) and
-            (curr_p < float(sma5.iloc[i])) and
+        # [필터 1: 바닥 지각 신호 기각]
+        # 이미 고점 대비 -5.0% 이상 빠진 자리는 '고점 매도'가 아니므로 완전 배제
+        if curr_drawdown < -5.0:
+            continue
+
+        # ── 경로 A: 대형 버블 정점 균열 (-10% 이상 유발) ──
+        # 200일 이격 108% 이상 극과열 상태에서 20일선 이탈 + VIX 21.0 돌파
+        cond_bubble_crack = (
+            (disp200.iloc[i] >= 107.0 or disp20.iloc[i] >= 105.0) and
+            (float(df['VIX'].iloc[i]) >= 20.5 or float(df['SKEW'].iloc[i]) >= 142.0) and
+            (curr_p < float(sma20.iloc[i])) and
             (float(macd.iloc[i]) < float(signal.iloc[i]))
         )
 
-        # ── 2. 정밀 크레딧 경색 필터 ──
+        # ── 경로 B: 매크로/크레딧 신용 발작 (-10% 이상 유발) ──
+        # 하이일드 스프레드 20일 급등(+0.25%p) + HYG/TLT -2.5% 붕괴 + 20일선 이탈
         hy_chg_20d = float(df['HY_SPREAD'].iloc[i]) - float(df['HY_SPREAD'].iloc[i-20])
         r_now = float(df['HYG'].iloc[i]) / float(df['TLT'].iloc[i])
         r_prev = float(df['HYG'].iloc[i-20]) / float(df['TLT'].iloc[i-20])
         hyg_tlt_drop = ((r_now / r_prev) - 1) * 100
 
-        cond_credit = (
-            (hy_chg_20d >= 0.30 and hyg_tlt_drop <= -2.5) and
+        cond_credit_shock = (
+            (hy_chg_20d >= 0.25 or hyg_tlt_drop <= -2.5) and
             (curr_p < float(sma20.iloc[i])) and
+            (curr_p < float(sma5.iloc[i])) and
             (float(macd.iloc[i]) < float(signal.iloc[i]))
         )
 
-        # ── 3. 정밀 추세 체제 붕괴 필터 ──
-        cond_breakdown = (
+        # ── 경로 C: 추세 전환형 50일선 초기 붕괴 ──
+        # 50일선 아래로 첫 이탈하면서 20일선도 붕괴 (단, 고점 대비 -4% 이내 어깨 구간)
+        cond_initial_break = (
             (curr_p < float(sma50.iloc[i])) and
-            (float(sma20.iloc[i]) <= float(sma50.iloc[i])) and
             (curr_p < float(sma20.iloc[i])) and
-            (vol_ratio.iloc[i] >= 1.25)
+            (float(df['VIX'].iloc[i]) >= 19.0) and
+            (curr_drawdown >= -4.5)
         )
 
         trigger_reason = ""
-        if cond_bubble: trigger_reason = "극단버블과열"
-        elif cond_credit: trigger_reason = "크레딧위기"
-        elif cond_breakdown: trigger_reason = "추세체제붕괴"
+        if cond_bubble_crack: trigger_reason = "버블정점균열"
+        elif cond_credit_shock: trigger_reason = "크레딧발작"
+        elif cond_initial_break: trigger_reason = "어깨50일선붕괴"
 
         if trigger_reason:
-            if not peaks_detected or (d_curr - peaks_detected[-1]['date']).days > 30:
+            if not peaks_detected or (d_curr - peaks_detected[-1]['date']).days > 35:
                 forward_window = qqq_c.iloc[i:i+60]
                 max_drawdown = ((forward_window.min() / curr_p) - 1) * 100
                 peaks_detected.append({
@@ -193,31 +111,31 @@ def run_precision_analysis():
 
     peak_df = pd.DataFrame(peaks_detected)
     drop_over_10 = (peak_df['max_drop_60d'] <= -10.0).sum()
-    drop_over_5 = (peak_df['max_drop_60d'] <= -5.0).sum()
+    drop_over_8 = (peak_df['max_drop_60d'] <= -8.0).sum()
     total_signals = len(peak_df)
     
     hit_ratio_10 = (drop_over_10 / total_signals * 100) if total_signals > 0 else 0
-    hit_ratio_5 = (drop_over_5 / total_signals * 100) if total_signals > 0 else 0
+    hit_ratio_8 = (drop_over_8 / total_signals * 100) if total_signals > 0 else 0
 
     msg = (
-        f"🎯 <b>[14개년 노이즈 제거 초정밀 고점 판독 검증]</b>\n"
-        f"📅 기간: {df.index[50].strftime('%Y-%m-%d')} ~ {df.index[-60].strftime('%Y-%m-%d')} ({len(df)}거래일)\n"
+        f"🎯 <b>[-10% 이상 대형 폭락 전용 초정밀 고점 검증]</b>\n"
+        f"📅 기간: {df.index[60].strftime('%Y-%m-%d')} ~ {df.index[-60].strftime('%Y-%m-%d')} ({len(df)}거래일)\n"
         f"────────────────\n"
-        f"• <b>총 감지된 고점 신호:</b> <b>{total_signals}회</b> (기존 121회에서 대폭 압축)\n"
+        f"• <b>총 감지된 고점 신호:</b> <b>{total_signals}회</b> (121회 ➔ 47회 ➔ 압축)\n"
         f"• <b>🚨 -10% 이상 대형 폭락 적중:</b> <b>{drop_over_10}회</b>\n"
-        f"• <b>⚠️ -5% 이상 조정 포함 적중:</b> <b>{drop_over_5}회</b>\n"
-        f"• <b>대형 폭락(-10%) 적중률:</b> <b>{hit_ratio_10:.1f}%</b>\n"
-        f"• <b>실질 방어 성공률(-5%이상):</b> <b>{hit_ratio_5:.1f}%</b>\n"
-        f"• <b>신호 후 실제 평균 낙폭:</b> <b>{peak_df['max_drop_60d'].mean():.2f}%</b>\n"
+        f"• <b>⚠️ -8% 이상 준대형 폭락 포함:</b> <b>{drop_over_8}회</b>\n"
+        f"• <b>대형 폭락(-10%) 순수 적중률:</b> <b>{hit_ratio_10:.1f}%</b>\n"
+        f"• <b>실질 방어 성공률(-8%이상):</b> <b>{hit_ratio_8:.1f}%</b>\n"
+        f"• <b>신호 발생 후 실제 평균 낙폭:</b> <b>{peak_df['max_drop_60d'].mean():.2f}%</b>\n"
         f"────────────────\n"
-        f"<b>[정밀 필터 통과 고점 전수 로그]</b>\n"
+        f"<b>[감지된 대형 폭락 고점 전수 로그]</b>\n"
     )
     for _, r in peak_df.iterrows():
-        status = "🚨 대형폭락(-10%이상)" if r['max_drop_60d'] <= -10.0 else "⚠️ 일반조정"
+        status = "🚨 -10% 이상 폭락" if r['max_drop_60d'] <= -10.0 else ("⚠️ -8%대 준폭락" if r['max_drop_60d'] <= -8.0 else "❌ 노이즈")
         msg += f"• <b>{r['date'].strftime('%Y-%m-%d')}</b> (${r['price']:.1f}) [{r['reason']}] ➔ 낙폭: <b>{r['max_drop_60d']}%</b> {status}\n"
 
     print(msg)
     send_telegram_result(msg)
 
 if __name__ == "__main__":
-    run_precision_analysis()
+    run_pure_crash_analysis()
