@@ -1,27 +1,28 @@
-name: Run Real Backtest
+name: Run Perfect Walkforward Backtest
 
 on:
-  workflow_dispatch: # 깃허브 웹에서 버튼 클릭으로 수동 실행하는 트리거
+  workflow_dispatch:
 
 jobs:
-  backtest:
+  walkforward-backtest:
     runs-on: ubuntu-latest
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
 
-      - name: 파이썬 설정
+      - name: 파이썬 3.11 환경 구성
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 필수 패키지 설치
+      - name: 필수 라이브러리 설치
         run: |
           pip install pandas numpy requests
 
-      - name: 백테스트 실행
+      - name: 무결성 백테스트 실행
         env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python backtest_engine.py
+          python perfect_walkforward_backtest.py
