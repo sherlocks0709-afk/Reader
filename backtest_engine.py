@@ -1,9 +1,12 @@
 import datetime
 import os
+import io
 import requests
 import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
+
+RAW_DB_FILE = "backtest_raw_db.csv"
 
 def send_telegram_result(text):
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -69,8 +72,7 @@ def fetch_fred_historical(series_id, api_key="", start_date="2023-04-20"):
                     if val != ".":
                         records.append({'Date': pd.to_datetime(obs['date']), series_id: float(val)})
                 if records:
-                    df = pd.DataFrame(records).set_index('Date')
-                    return df
+                    return pd.DataFrame(records).set_index('Date')
         except Exception:
             pass
 
@@ -89,15 +91,68 @@ def fetch_fred_historical(series_id, api_key="", start_date="2023-04-20"):
         pass
     return pd.DataFrame()
 
+def load_or_build_raw_database():
+    """
+    로컬 DB(backtest_raw_db.csv)가 존재하면 0.1초 만에 불러오고,
+    없으면 1회 전수 수집하여 DB 파일로 영구 저장(Caching)
+    """
+    if os.path.exists(RAW_DB_FILE):
+        try:
+            print(f"📦 [로컬 DB 로드] '{RAW_DB_FILE}' 파일에서 과거 매크로 시계열 데이터를 즉시 불러옵니다.")
+            df = pd.read_csv(RAW_DB_FILE)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            if not df.empty and len(df) > 500:
+                return df
+        except Exception as e:
+            print(f"⚠️ 기존 DB 파일 파싱 실패, 원천 재수집을 시작합니다: {e}")
+
+    print("🌐 [신규 DB 구축] CBOE, FRED, Yahoo에서 2023.04 이후 전수 데이터를 1회 다운로드하여 DB를 생성합니다...")
+    qqq = get_historical_data("QQQ")
+    tqqq = get_historical_data("TQQQ")
+    vix = get_historical_data("^VIX")
+    vix1d = get_historical_data("^VIX1D")
+    vxn = get_historical_data("^VXN")
+    skew = get_historical_data("^SKEW")
+    hyg = get_historical_data("HYG")
+    tlt = get_historical_data("TLT")
+    qqqe = get_historical_data("QQQE")
+    dxy = get_historical_data("DX-Y.NYB")
+    usdjpy = get_historical_data("USDJPY=X")
+
+    fred_key = os.environ.get("FRED_API_KEY", "")
+    df_hy = fetch_fred_historical("BAMLH0A0HYM2", fred_key)
+    df_sofr = fetch_fred_historical("SOFR", fred_key)
+    df_iorb = fetch_fred_historical("IORB", fred_key)
+
+    df = pd.DataFrame({
+        'QQQ_Close': qqq['Close'], 'QQQ_Open': qqq['Open'],
+        'QQQ_High': qqq['High'], 'QQQ_Low': qqq['Low'], 'QQQ_Vol': qqq['Volume'],
+        'TQQQ_Close': tqqq['Close'], 'TQQQ_Open': tqqq['Open']
+    })
+    df['VIX'] = vix['Close']
+    df['VIX1D'] = vix1d['Close'] if not vix1d.empty else vix['Close']
+    df['VXN'] = vxn['Close'] if not vxn.empty else vix['Close'] * 1.1
+    df['SKEW'] = skew['Close'] if not skew.empty else 125.0
+    df['HYG'] = hyg['Close'] if not hyg.empty else 75.0
+    df['TLT'] = tlt['Close'] if not tlt.empty else 90.0
+    df['QQQE'] = qqqe['Close'] if not qqqe.empty else qqq['Close']
+    df['DXY'] = dxy['Close'] if not dxy.empty else 103.0
+    df['USDJPY'] = usdjpy['Close'] if not usdjpy.empty else 150.0
+
+    df['HY_SPREAD'] = df_hy['BAMLH0A0HYM2'] if not df_hy.empty else 3.5
+    df['SOFR'] = df_sofr['SOFR'] if not df_sofr.empty else 5.3
+    df['IORB'] = df_iorb['IORB'] if not df_iorb.empty else 5.4
+
+    df = df.ffill().bfill().dropna()
+    df.to_csv(RAW_DB_FILE)
+    print(f"✅ '{RAW_DB_FILE}' 생성 및 영구 캐싱 완료 ({len(df)}거래일)")
+    return df
+
 def evaluate_regime_at_day(slice_df):
-    """
-    T 시점의 데이터 슬라이스만 입력받아 nasdaq_monitor.py의 판독 로직을 100% 동일하게 실행
-    Look-Ahead Bias 완전 배제
-    """
     qqq_close = slice_df['QQQ_Close']
     current_close = qqq_close.iloc[-1]
     
-    # 이평선 및 지표 산출
     sma5_s = qqq_close.rolling(5).mean()
     sma20_s = qqq_close.rolling(20).mean()
     sma50_s = qqq_close.rolling(50).mean()
@@ -198,13 +253,10 @@ def evaluate_regime_at_day(slice_df):
     below_sma50 = current_close < sma50
     macd_dead = macd_s.iloc[-1] < sig_s.iloc[-1]
 
-    # 3단계 수급 (거래량 비율 & 핀바)
     vol_20avg = slice_df['QQQ_Vol'].rolling(20).mean().iloc[-1]
     vol_ratio = slice_df['QQQ_Vol'].iloc[-1] / vol_20avg if vol_20avg > 0 else 1.0
-    heavy_sell = below_sma5 and (vol_ratio >= 1.25)
     low_vol_pullback = below_sma5 and (vol_ratio < 0.85)
 
-    # 4단계 동적 사이징 & 2대 미세튜닝
     tr1 = slice_df['QQQ_High'] - slice_df['QQQ_Low']
     tr2 = (slice_df['QQQ_High'] - qqq_close.shift(1)).abs()
     tr3 = (slice_df['QQQ_Low'] - qqq_close.shift(1)).abs()
@@ -213,7 +265,6 @@ def evaluate_regime_at_day(slice_df):
 
     vol_cap = 0.75 if atr_pct >= 2.5 else 1.0
     
-    # [미세튜닝 2] 50·200일선 수평 횡보장 레버리지 캡
     sma50_prev5 = sma50_s.iloc[-6] if len(sma50_s) >= 6 else sma50
     sma200_prev5 = sma200_s.iloc[-6] if len(sma200_s) >= 6 else sma200
     if abs(((sma50/sma50_prev5)-1)*100) <= 0.20 and abs(((sma200/sma200_prev5)-1)*100) <= 0.20:
@@ -222,25 +273,20 @@ def evaluate_regime_at_day(slice_df):
     is_extreme_tail = (skew_curr >= 145.0 and ratio_0dte >= 1.35)
     is_climax = (disp_20 >= 108.0)
 
-    # 기본 배분 모델 (90:5:5)
     target_qqq = 0.90
     target_kr2x = 0.05 * vol_cap
     target_tqqq = 0.05 * vol_cap
 
-    peak_price = slice_df['QQQ_Close'].max()
-    drawdown = ((current_close / peak_price) - 1) * 100
-
-    # 위험 국면 분할 축소 로직
     if total_score >= 80:
         if below_sma5 or macd_dead:
             target_qqq, target_kr2x, target_tqqq = 0.0, 0.0, 0.0
     elif total_score >= 65:
         if below_sma50 or (below_sma5 and macd_dead and below_sma20):
             target_qqq, target_kr2x, target_tqqq = 0.30, 0.01, 0.0075
-        elif (below_sma5 and macd_dead) or heavy_sell or below_sma20:
+        elif (below_sma5 and macd_dead) or below_sma20:
             target_qqq, target_kr2x, target_tqqq = 0.60, 0.025, 0.02
         elif below_sma5:
-            if not (low_vol_pullback):
+            if not low_vol_pullback:
                 target_qqq, target_kr2x, target_tqqq = 0.75, 0.04, 0.0375
     elif is_extreme_tail or is_climax:
         target_kr2x *= 0.85
@@ -253,45 +299,8 @@ def evaluate_regime_at_day(slice_df):
     return target_qqq, target_kr2x, target_tqqq, total_score
 
 def run_perfect_walkforward_backtest():
-    print("⏳ [Step 1] 무결성 과거 데이터 수집 및 전처리...")
-    qqq = get_historical_data("QQQ")
-    tqqq = get_historical_data("TQQQ")
-    vix = get_historical_data("^VIX")
-    vix1d = get_historical_data("^VIX1D")
-    vxn = get_historical_data("^VXN")
-    skew = get_historical_data("^SKEW")
-    hyg = get_historical_data("HYG")
-    tlt = get_historical_data("TLT")
-    qqqe = get_historical_data("QQQE")
-    dxy = get_historical_data("DX-Y.NYB")
-    usdjpy = get_historical_data("USDJPY=X")
-
-    fred_key = os.environ.get("FRED_API_KEY", "")
-    df_hy = fetch_fred_historical("BAMLH0A0HYM2", fred_key)
-    df_sofr = fetch_fred_historical("SOFR", fred_key)
-    df_iorb = fetch_fred_historical("IORB", fred_key)
-
-    # 데이터 프레임 병합
-    df = pd.DataFrame({
-        'QQQ_Close': qqq['Close'], 'QQQ_Open': qqq['Open'],
-        'QQQ_High': qqq['High'], 'QQQ_Low': qqq['Low'], 'QQQ_Vol': qqq['Volume'],
-        'TQQQ_Close': tqqq['Close'], 'TQQQ_Open': tqqq['Open']
-    })
-    df['VIX'] = vix['Close']
-    df['VIX1D'] = vix1d['Close'] if not vix1d.empty else vix['Close']
-    df['VXN'] = vxn['Close'] if not vxn.empty else vix['Close'] * 1.1
-    df['SKEW'] = skew['Close'] if not skew.empty else 125.0
-    df['HYG'] = hyg['Close'] if not hyg.empty else 75.0
-    df['TLT'] = tlt['Close'] if not tlt.empty else 90.0
-    df['QQQE'] = qqqe['Close'] if not qqqe.empty else qqq['Close']
-    df['DXY'] = dxy['Close'] if not dxy.empty else 103.0
-    df['USDJPY'] = usdjpy['Close'] if not usdjpy.empty else 150.0
-
-    df['HY_SPREAD'] = df_hy['BAMLH0A0HYM2'] if not df_hy.empty else 3.5
-    df['SOFR'] = df_sofr['SOFR'] if not df_sofr.empty else 5.3
-    df['IORB'] = df_iorb['IORB'] if not df_iorb.empty else 5.4
-
-    df = df.ffill().bfill().dropna()
+    # ── 1. DB 로드 또는 신규 구축 ──
+    df = load_or_build_raw_database()
 
     print(f"⏳ [Step 2] {len(df)}개 거래일 Walk-Forward 타임머신 시뮬레이션 가동...")
     init_cash = 10000.0
@@ -299,11 +308,6 @@ def run_perfect_walkforward_backtest():
     daily_sgov_rate = (1 + 0.05) ** (1/252) - 1
 
     cash = 0.0
-    pos_qqq_qty = 0.0
-    pos_kr2x_qty = 0.0
-    pos_tqqq_qty = 0.0
-
-    # 20거래일 시점에 90:5:5 포트폴리오 첫 진입
     first_idx = 20
     first_open_qqq = df['QQQ_Open'].iloc[first_idx]
     first_open_tqqq = df['TQQQ_Open'].iloc[first_idx]
@@ -316,8 +320,6 @@ def run_perfect_walkforward_backtest():
     strat_values = []
     bench_values = []
     dates_list = []
-
-    cum_realized_pnl = 0.0 # 연간 세금 계산용
 
     for i in range(first_idx, len(df) - 1):
         d_curr = df.index[i]
@@ -337,7 +339,7 @@ def run_perfect_walkforward_backtest():
         target_kr2x_v = curr_total * t_kr2x_r
         target_tqqq_v = curr_total * t_tqqq_r
 
-        # QQQ 리밸런싱 (5% 데드밴드 적용)
+        # QQQ 리밸런싱 (5% 데드밴드)
         curr_qqq_v = pos_qqq_qty * next_open_qqq
         if abs(curr_qqq_v - target_qqq_v) > (curr_total * 0.05):
             if curr_qqq_v > target_qqq_v:
@@ -373,17 +375,15 @@ def run_perfect_walkforward_backtest():
                 cash -= buy_val
                 pos_tqqq_qty += (buy_val * (1 - fee_rate)) / next_open_tqqq
 
-        # 현금 SGOV 일별 무위험 이자 가산
         cash *= (1 + daily_sgov_rate)
 
-        # 익일 종가 기준 확정 자산 산출
         next_close_qqq = df['QQQ_Close'].iloc[i+1]
         next_close_tqqq = df['TQQQ_Close'].iloc[i+1]
 
         final_day_v = (pos_qqq_qty * next_close_qqq) + (pos_kr2x_qty * next_close_qqq * 2) + (pos_tqqq_qty * next_close_tqqq) + cash
         bench_v = init_cash * (next_close_qqq / df['QQQ_Close'].iloc[first_idx])
 
-        # 연말 22% 양도소득세 정산
+        # 연말 22% 세후 정산
         if d_next.month == 12 and d_next.day >= 28 and i < len(df) - 2 and df.index[i+2].year != d_next.year:
             annual_gain = max(0.0, final_day_v - init_cash)
             tax = annual_gain * 0.22
@@ -410,13 +410,14 @@ def run_perfect_walkforward_backtest():
     report_msg = (
         f"🏆 <b>[Walk-Forward 무결성 실데이터 백테스트 완료]</b>\n"
         f"📅 기간: {dates_list[0].strftime('%Y-%m-%d')} ~ {dates_list[-1].strftime('%Y-%m-%d')} ({total_days}거래일)\n"
+        f"📁 DB 상태: <code>{RAW_DB_FILE}</code> 로컬 캐싱 적용\n"
         f"────────────────\n"
         f"• <b>세후 최종 자산:</b> <b>${res_df['Strategy'].iloc[-1]:,.2f}</b> (QQQ: ${res_df['Benchmark'].iloc[-1]:,.2f})\n"
         f"• <b>세후 연복리 (CAGR):</b> <b>{cagr_strat:+.2f}%</b> (알파: <b>{alpha:+.2f}%p</b>)\n"
         f"• <b>최대 낙폭 (MDD):</b> <b>{mdd_strat:.2f}%</b> (QQQ: <b>{mdd_bench:.2f}%</b>)\n"
         f"• <b>샤프 지수 (Sharpe):</b> <b>{sharpe:.2f}</b>\n"
         f"────────────────\n"
-        f"👉 <i>12개 매크로 팩터 일별 시계열 슬라이스 & T+1 시초가 체결 전수 검증 결과입니다.</i>"
+        f"👉 <i>12개 팩터 타임머신 슬라이스 & T+1 시초가 체결 전수 검증 결과입니다.</i>"
     )
     print(report_msg)
     send_telegram_result(report_msg)
