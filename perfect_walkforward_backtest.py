@@ -27,27 +27,29 @@ def get_historical_data(ticker_symbol, start_date="2023-04-20"):
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code == 200:
-            res_data = res.json()['chart']['result'][0]
-            timestamps = res_data['timestamp']
-            quotes = res_data['indicators']['quote'][0]
-            ny_tz = ZoneInfo("America/New_York")
-            dates = [datetime.datetime.fromtimestamp(ts, tz=ny_tz).date() for ts in timestamps]
-            
-            df = pd.DataFrame({
-                'Date': pd.to_datetime(dates),
-                'Open': quotes.get('open', []),
-                'High': quotes.get('high', []),
-                'Low': quotes.get('low', []),
-                'Close': quotes.get('close', []),
-                'Volume': quotes.get('volume', [])
-            }).dropna(subset=['Close'])
-            
-            df['Open'] = df['Open'].fillna(df['Close'])
-            df['High'] = df['High'].fillna(df['Close'])
-            df['Low'] = df['Low'].fillna(df['Close'])
-            df['Volume'] = df['Volume'].fillna(1.0)
-            df.set_index('Date', inplace=True)
-            return df[df.index >= pd.to_datetime(start_date)].astype(float)
+            data = res.json()
+            if 'chart' in data and data['chart']['result']:
+                res_data = data['chart']['result'][0]
+                timestamps = res_data.get('timestamp', [])
+                quotes = res_data.get('indicators', {}).get('quote', [{}])[0]
+                ny_tz = ZoneInfo("America/New_York")
+                dates = [datetime.datetime.fromtimestamp(ts, tz=ny_tz).date() for ts in timestamps]
+                
+                df = pd.DataFrame({
+                    'Date': pd.to_datetime(dates),
+                    'Open': quotes.get('open', []),
+                    'High': quotes.get('high', []),
+                    'Low': quotes.get('low', []),
+                    'Close': quotes.get('close', []),
+                    'Volume': quotes.get('volume', [])
+                }).dropna(subset=['Close'])
+                
+                df['Open'] = df['Open'].fillna(df['Close'])
+                df['High'] = df['High'].fillna(df['Close'])
+                df['Low'] = df['Low'].fillna(df['Close'])
+                df['Volume'] = df['Volume'].fillna(1.0)
+                df.set_index('Date', inplace=True)
+                return df[df.index >= pd.to_datetime(start_date)].astype(float)
     except Exception as e:
         print(f"데이터 수집 에러 ({ticker_symbol}): {e}")
     return pd.DataFrame()
@@ -92,22 +94,18 @@ def fetch_fred_historical(series_id, api_key="", start_date="2023-04-20"):
     return pd.DataFrame()
 
 def load_or_build_raw_database():
-    """
-    로컬 DB(backtest_raw_db.csv)가 존재하면 0.1초 만에 불러오고,
-    없으면 1회 전수 수집하여 DB 파일로 영구 저장(Caching)
-    """
     if os.path.exists(RAW_DB_FILE):
         try:
-            print(f"📦 [로컬 DB 로드] '{RAW_DB_FILE}' 파일에서 과거 매크로 시계열 데이터를 즉시 불러옵니다.")
+            print(f"📦 [로컬 DB 로드] '{RAW_DB_FILE}' 파일에서 과거 매크로 시계열 데이터를 불러옵니다.")
             df = pd.read_csv(RAW_DB_FILE)
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
-            if not df.empty and len(df) > 500:
+            if not df.empty and len(df) > 300:
                 return df
         except Exception as e:
-            print(f"⚠️ 기존 DB 파일 파싱 실패, 원천 재수집을 시작합니다: {e}")
+            print(f"⚠️ 기존 DB 파일 파싱 실패, 신규 수집을 진행합니다: {e}")
 
-    print("🌐 [신규 DB 구축] CBOE, FRED, Yahoo에서 2023.04 이후 전수 데이터를 1회 다운로드하여 DB를 생성합니다...")
+    print("🌐 [신규 DB 구축] CBOE, FRED, Yahoo에서 2023.04 이후 전수 데이터를 다운로드합니다...")
     qqq = get_historical_data("QQQ")
     tqqq = get_historical_data("TQQQ")
     vix = get_historical_data("^VIX")
@@ -126,17 +124,22 @@ def load_or_build_raw_database():
     df_iorb = fetch_fred_historical("IORB", fred_key)
 
     df = pd.DataFrame({
-        'QQQ_Close': qqq['Close'], 'QQQ_Open': qqq['Open'],
-        'QQQ_High': qqq['High'], 'QQQ_Low': qqq['Low'], 'QQQ_Vol': qqq['Volume'],
-        'TQQQ_Close': tqqq['Close'], 'TQQQ_Open': tqqq['Open']
+        'QQQ_Close': qqq['Close'] if not qqq.empty else pd.Series(dtype=float),
+        'QQQ_Open': qqq['Open'] if not qqq.empty else pd.Series(dtype=float),
+        'QQQ_High': qqq['High'] if not qqq.empty else pd.Series(dtype=float),
+        'QQQ_Low': qqq['Low'] if not qqq.empty else pd.Series(dtype=float),
+        'QQQ_Vol': qqq['Volume'] if not qqq.empty else pd.Series(dtype=float),
+        'TQQQ_Close': tqqq['Close'] if not tqqq.empty else pd.Series(dtype=float),
+        'TQQQ_Open': tqqq['Open'] if not tqqq.empty else pd.Series(dtype=float)
     })
-    df['VIX'] = vix['Close']
-    df['VIX1D'] = vix1d['Close'] if not vix1d.empty else vix['Close']
-    df['VXN'] = vxn['Close'] if not vxn.empty else vix['Close'] * 1.1
+    
+    df['VIX'] = vix['Close'] if not vix.empty else 18.0
+    df['VIX1D'] = vix1d['Close'] if not vix1d.empty else (df['VIX'] * 1.0)
+    df['VXN'] = vxn['Close'] if not vxn.empty else (df['VIX'] * 1.1)
     df['SKEW'] = skew['Close'] if not skew.empty else 125.0
     df['HYG'] = hyg['Close'] if not hyg.empty else 75.0
     df['TLT'] = tlt['Close'] if not tlt.empty else 90.0
-    df['QQQE'] = qqqe['Close'] if not qqqe.empty else qqq['Close']
+    df['QQQE'] = qqqe['Close'] if not qqqe.empty else df['QQQ_Close']
     df['DXY'] = dxy['Close'] if not dxy.empty else 103.0
     df['USDJPY'] = usdjpy['Close'] if not usdjpy.empty else 150.0
 
@@ -151,52 +154,53 @@ def load_or_build_raw_database():
 
 def evaluate_regime_at_day(slice_df):
     qqq_close = slice_df['QQQ_Close']
-    current_close = qqq_close.iloc[-1]
+    current_close = float(qqq_close.iloc[-1])
     
     sma5_s = qqq_close.rolling(5).mean()
     sma20_s = qqq_close.rolling(20).mean()
     sma50_s = qqq_close.rolling(50).mean()
     sma200_s = qqq_close.rolling(200, min_periods=20).mean()
     
-    sma5 = sma5_s.iloc[-1]
-    sma20 = sma20_s.iloc[-1]
-    sma50 = sma50_s.iloc[-1]
-    sma200 = sma200_s.iloc[-1]
+    sma5 = float(sma5_s.iloc[-1])
+    sma20 = float(sma20_s.iloc[-1])
+    sma50 = float(sma50_s.iloc[-1])
+    sma200 = float(sma200_s.iloc[-1])
     
     disp200_s = (qqq_close / sma200_s) * 100
-    disp_200 = disp200_s.iloc[-1]
+    disp_200 = float(disp200_s.iloc[-1])
     disp_20 = (current_close / sma20) * 100
     
     rolling_std20 = qqq_close.rolling(20).std()
-    bb_width = (((sma20 + rolling_std20.iloc[-1]*2) - (sma20 - rolling_std20.iloc[-1]*2)) / sma20) * 100
+    bb_width = (((sma20 + float(rolling_std20.iloc[-1])*2) - (sma20 - float(rolling_std20.iloc[-1])*2)) / sma20) * 100
     is_ranging_market = (bb_width <= 4.0)
 
     # 1. 200일 이격 Z (7.5점)
-    disp_mean = disp200_s.mean()
-    disp_std = disp200_s.std()
+    disp_mean = float(disp200_s.mean())
+    disp_std = float(disp200_s.std())
     z_disp = (disp_200 - disp_mean) / disp_std if disp_std > 0 else 0.0
     score_disp = float(np.clip(z_disp * (7.5 / 2.0), 0, 7.5))
 
     # 2. 주봉 RSI (7.5점)
     gain_s = (qqq_close.diff().where(qqq_close.diff() > 0, 0)).rolling(14).mean()
     loss_s = (-qqq_close.diff().where(qqq_close.diff() < 0, 0)).rolling(14).mean()
-    rs = gain_s.iloc[-1] / (loss_s.iloc[-1] if loss_s.iloc[-1] > 0 else 1e-5)
+    l_val = float(loss_s.iloc[-1]) if float(loss_s.iloc[-1]) > 0 else 1e-5
+    rs = float(gain_s.iloc[-1]) / l_val
     rsi_val = 100 - (100 / (1 + rs))
     score_rsi = float(np.clip((rsi_val - 50) * (7.5 / 30), 0, 7.5))
 
     # 3. VXN (7.0점)
-    qqq_20d_ret = ((current_close / qqq_close.iloc[-20]) - 1) * 100 if len(qqq_close) >= 20 else 0.0
-    vxn_curr = slice_df['VXN'].iloc[-1]
-    vxn_20d_ago = slice_df['VXN'].iloc[-20] if len(slice_df) >= 20 else vxn_curr
+    qqq_20d_ret = ((current_close / float(qqq_close.iloc[-20])) - 1) * 100 if len(qqq_close) >= 20 else 0.0
+    vxn_curr = float(slice_df['VXN'].iloc[-1])
+    vxn_20d_ago = float(slice_df['VXN'].iloc[-20]) if len(slice_df) >= 20 else vxn_curr
     score_vxn = 0.0
     if qqq_20d_ret > 0 and (vxn_curr - vxn_20d_ago) >= 2.0: score_vxn = 7.0
     elif qqq_20d_ret > 0 and (vxn_curr - vxn_20d_ago) >= 0.5: score_vxn = 3.5
 
     # 4. SKEW & 0DTE (7.0점)
-    skew_curr = slice_df['SKEW'].iloc[-1]
+    skew_curr = float(slice_df['SKEW'].iloc[-1])
     score_skew = float(np.clip((skew_curr - 120) * (7.0 / 25), 0, 7.0))
-    vix_curr = slice_df['VIX'].iloc[-1]
-    vix1d_curr = slice_df['VIX1D'].iloc[-1]
+    vix_curr = float(slice_df['VIX'].iloc[-1])
+    vix1d_curr = float(slice_df['VIX1D'].iloc[-1])
     ratio_0dte = (vix1d_curr / vix_curr) if vix_curr > 0 else 1.0
     if ratio_0dte >= 1.25: score_skew = min(7.0, score_skew + 2.0)
 
@@ -207,14 +211,14 @@ def evaluate_regime_at_day(slice_df):
     # 6. QQQ vs QQQE (8.0점)
     score_breadth = 0.0
     if len(slice_df) >= 20:
-        qqqe_ret = ((slice_df['QQQE'].iloc[-1] / slice_df['QQQE'].iloc[-20]) - 1) * 100
+        qqqe_ret = ((float(slice_df['QQQE'].iloc[-1]) / float(slice_df['QQQE'].iloc[-20])) - 1) * 100
         if qqq_20d_ret > 0 and (qqq_20d_ret - qqqe_ret) >= 3.0: score_breadth = 8.0
 
     # 7. HYG/TLT 크레딧 (7.0점)
     score_hyg_tlt = 0.0
     if len(slice_df) >= 20:
-        r_now = slice_df['HYG'].iloc[-1] / slice_df['TLT'].iloc[-1]
-        r_prev = slice_df['HYG'].iloc[-20] / slice_df['TLT'].iloc[-20]
+        r_now = float(slice_df['HYG'].iloc[-1]) / float(slice_df['TLT'].iloc[-1])
+        r_prev = float(slice_df['HYG'].iloc[-20]) / float(slice_df['TLT'].iloc[-20])
         r_chg = ((r_now / r_prev) - 1) * 100
         if qqq_20d_ret > 0 and r_chg <= -2.5: score_hyg_tlt = 7.0
         elif qqq_20d_ret > 0 and r_chg <= -1.0: score_hyg_tlt = 3.5
@@ -222,28 +226,28 @@ def evaluate_regime_at_day(slice_df):
     # 8. 환율 / 엔캐리 (10.0점)
     score_fx = 0.0
     if len(slice_df) >= 20:
-        dxy_chg = ((slice_df['DXY'].iloc[-1] / slice_df['DXY'].iloc[-20]) - 1) * 100
+        dxy_chg = ((float(slice_df['DXY'].iloc[-1]) / float(slice_df['DXY'].iloc[-20])) - 1) * 100
         if dxy_chg >= 2.5: score_fx += 5.0
         elif dxy_chg >= 1.2: score_fx += 2.5
     if len(slice_df) >= 5:
-        jpy_chg = ((slice_df['USDJPY'].iloc[-1] / slice_df['USDJPY'].iloc[-5]) - 1) * 100
+        jpy_chg = ((float(slice_df['USDJPY'].iloc[-1]) / float(slice_df['USDJPY'].iloc[-5])) - 1) * 100
         if jpy_chg <= -2.5: score_fx += 5.0
 
     # 9. FRED 하이일드 (12.0점)
-    hy_spread = slice_df['HY_SPREAD'].iloc[-1]
+    hy_spread = float(slice_df['HY_SPREAD'].iloc[-1])
     score_hy = float(np.clip((4.5 - hy_spread) * (6.0 / 1.5), 0, 6.0))
     if len(slice_df) >= 20 and qqq_20d_ret > 0:
-        if (hy_spread - slice_df['HY_SPREAD'].iloc[-20]) >= 0.20: score_hy += 6.0
+        if (hy_spread - float(slice_df['HY_SPREAD'].iloc[-20])) >= 0.20: score_hy += 6.0
 
     # 10. SOFR-IORB (10.0점)
     score_sofr = 0.0
-    sofr_bps = (slice_df['SOFR'].iloc[-1] - slice_df['IORB'].iloc[-1]) * 100
+    sofr_bps = (float(slice_df['SOFR'].iloc[-1]) - float(slice_df['IORB'].iloc[-1])) * 100
     if sofr_bps >= 8.0: score_sofr = 10.0
     elif sofr_bps >= 3.0: score_sofr = 5.0
 
     total_score = round(score_disp + score_rsi + score_vxn + score_skew + score_term + score_breadth + score_hyg_tlt + score_fx + score_hy + score_sofr, 1)
 
-    # 2단계 추세 & MACD
+    # 2단계 추세
     ema12 = qqq_close.ewm(span=12, adjust=False).mean()
     ema26 = qqq_close.ewm(span=26, adjust=False).mean()
     macd_s = ema12 - ema26
@@ -251,22 +255,22 @@ def evaluate_regime_at_day(slice_df):
     below_sma5 = current_close < sma5
     below_sma20 = current_close < sma20
     below_sma50 = current_close < sma50
-    macd_dead = macd_s.iloc[-1] < sig_s.iloc[-1]
+    macd_dead = float(macd_s.iloc[-1]) < float(sig_s.iloc[-1])
 
-    vol_20avg = slice_df['QQQ_Vol'].rolling(20).mean().iloc[-1]
-    vol_ratio = slice_df['QQQ_Vol'].iloc[-1] / vol_20avg if vol_20avg > 0 else 1.0
+    vol_20avg = float(slice_df['QQQ_Vol'].rolling(20).mean().iloc[-1])
+    vol_ratio = float(slice_df['QQQ_Vol'].iloc[-1]) / vol_20avg if vol_20avg > 0 else 1.0
     low_vol_pullback = below_sma5 and (vol_ratio < 0.85)
 
     tr1 = slice_df['QQQ_High'] - slice_df['QQQ_Low']
     tr2 = (slice_df['QQQ_High'] - qqq_close.shift(1)).abs()
     tr3 = (slice_df['QQQ_Low'] - qqq_close.shift(1)).abs()
-    atr14 = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean().iloc[-1]
+    atr14 = float(pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
     atr_pct = (atr14 / current_close) * 100
 
     vol_cap = 0.75 if atr_pct >= 2.5 else 1.0
     
-    sma50_prev5 = sma50_s.iloc[-6] if len(sma50_s) >= 6 else sma50
-    sma200_prev5 = sma200_s.iloc[-6] if len(sma200_s) >= 6 else sma200
+    sma50_prev5 = float(sma50_s.iloc[-6]) if len(sma50_s) >= 6 else sma50
+    sma200_prev5 = float(sma200_s.iloc[-6]) if len(sma200_s) >= 6 else sma200
     if abs(((sma50/sma50_prev5)-1)*100) <= 0.20 and abs(((sma200/sma200_prev5)-1)*100) <= 0.20:
         vol_cap = min(vol_cap, 0.50)
 
@@ -299,7 +303,6 @@ def evaluate_regime_at_day(slice_df):
     return target_qqq, target_kr2x, target_tqqq, total_score
 
 def run_perfect_walkforward_backtest():
-    # ── 1. DB 로드 또는 신규 구축 ──
     df = load_or_build_raw_database()
 
     print(f"⏳ [Step 2] {len(df)}개 거래일 Walk-Forward 타임머신 시뮬레이션 가동...")
@@ -309,8 +312,8 @@ def run_perfect_walkforward_backtest():
 
     cash = 0.0
     first_idx = 20
-    first_open_qqq = df['QQQ_Open'].iloc[first_idx]
-    first_open_tqqq = df['TQQQ_Open'].iloc[first_idx]
+    first_open_qqq = float(df['QQQ_Open'].iloc[first_idx])
+    first_open_tqqq = float(df['TQQQ_Open'].iloc[first_idx])
 
     pos_qqq_qty = (init_cash * 0.90) / first_open_qqq
     pos_kr2x_qty = (init_cash * 0.05) / first_open_qqq
@@ -322,16 +325,13 @@ def run_perfect_walkforward_backtest():
     dates_list = []
 
     for i in range(first_idx, len(df) - 1):
-        d_curr = df.index[i]
         d_next = df.index[i+1]
 
-        # [T 시점] 과거 데이터 슬라이스로만 판독
         slice_df = df.iloc[:i+1]
         t_qqq_r, t_kr2x_r, t_tqqq_r, score = evaluate_regime_at_day(slice_df)
 
-        # [T+1 시점] 익일 시초가 리밸런싱 집행
-        next_open_qqq = df['QQQ_Open'].iloc[i+1]
-        next_open_tqqq = df['TQQQ_Open'].iloc[i+1]
+        next_open_qqq = float(df['QQQ_Open'].iloc[i+1])
+        next_open_tqqq = float(df['TQQQ_Open'].iloc[i+1])
 
         curr_total = (pos_qqq_qty * next_open_qqq) + (pos_kr2x_qty * next_open_qqq * 2) + (pos_tqqq_qty * next_open_tqqq) + cash
 
@@ -339,7 +339,6 @@ def run_perfect_walkforward_backtest():
         target_kr2x_v = curr_total * t_kr2x_r
         target_tqqq_v = curr_total * t_tqqq_r
 
-        # QQQ 리밸런싱 (5% 데드밴드)
         curr_qqq_v = pos_qqq_qty * next_open_qqq
         if abs(curr_qqq_v - target_qqq_v) > (curr_total * 0.05):
             if curr_qqq_v > target_qqq_v:
@@ -351,7 +350,6 @@ def run_perfect_walkforward_backtest():
                 cash -= buy_val
                 pos_qqq_qty += (buy_val * (1 - fee_rate)) / next_open_qqq
 
-        # KR 2배수 리밸런싱
         curr_kr2x_v = pos_kr2x_qty * next_open_qqq * 2
         if abs(curr_kr2x_v - target_kr2x_v) > (curr_total * 0.02):
             if curr_kr2x_v > target_kr2x_v:
@@ -363,7 +361,6 @@ def run_perfect_walkforward_backtest():
                 cash -= buy_val
                 pos_kr2x_qty += ((buy_val / 2) * (1 - fee_rate)) / next_open_qqq
 
-        # TQQQ 리밸런싱
         curr_tqqq_v = pos_tqqq_qty * next_open_tqqq
         if abs(curr_tqqq_v - target_tqqq_v) > (curr_total * 0.02):
             if curr_tqqq_v > target_tqqq_v:
@@ -377,13 +374,12 @@ def run_perfect_walkforward_backtest():
 
         cash *= (1 + daily_sgov_rate)
 
-        next_close_qqq = df['QQQ_Close'].iloc[i+1]
-        next_close_tqqq = df['TQQQ_Close'].iloc[i+1]
+        next_close_qqq = float(df['QQQ_Close'].iloc[i+1])
+        next_close_tqqq = float(df['TQQQ_Close'].iloc[i+1])
 
         final_day_v = (pos_qqq_qty * next_close_qqq) + (pos_kr2x_qty * next_close_qqq * 2) + (pos_tqqq_qty * next_close_tqqq) + cash
-        bench_v = init_cash * (next_close_qqq / df['QQQ_Close'].iloc[first_idx])
+        bench_v = init_cash * (next_close_qqq / float(df['QQQ_Close'].iloc[first_idx]))
 
-        # 연말 22% 세후 정산
         if d_next.month == 12 and d_next.day >= 28 and i < len(df) - 2 and df.index[i+2].year != d_next.year:
             annual_gain = max(0.0, final_day_v - init_cash)
             tax = annual_gain * 0.22
@@ -404,7 +400,6 @@ def run_perfect_walkforward_backtest():
 
     daily_ret = res_df['Strategy'].pct_change().dropna()
     sharpe = (daily_ret.mean() / daily_ret.std()) * np.sqrt(252) if daily_ret.std() > 0 else 0.0
-
     alpha = cagr_strat - cagr_bench
 
     report_msg = (
