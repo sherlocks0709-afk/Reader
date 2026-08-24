@@ -1,0 +1,27 @@
+name: Run Real Backtest
+
+on:
+  workflow_dispatch: # 깃허브 웹에서 버튼 클릭으로 수동 실행하는 트리거
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 필수 패키지 설치
+        run: |
+          pip install pandas numpy requests
+
+      - name: 백테스트 실행
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python backtest_engine.py
