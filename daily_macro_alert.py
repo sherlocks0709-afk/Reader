@@ -6,17 +6,17 @@ import requests
 import yfinance as yf
 
 # -------------------------------------------------------------
-# 1. 기존 세팅된 텔레그램 환경 변수 및 DB 로드
+# 1. 텔레그램 환경 변수 로드 (변수명 다변화 대응)
 # -------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_FILE_PATH = "history_db.csv"
 
 
 def send_telegram_message(message: str):
-    """텔레그램 메시지 발송"""
+    """HTML 모드로 안전하게 텔레그램 메시지 발송"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[주의] 텔레그램 환경 변수(TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)가 없어 콘솔로 출력합니다.")
+        print("[주의] 텔레그램 환경 변수가 설정되지 않아 콘솔 출력으로 대체합니다.")
         print(message)
         return
 
@@ -24,16 +24,17 @@ def send_telegram_message(message: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            print(">> [성공] 텔레그램 알림 발송 완료")
+        res_json = res.json()
+        if res.status_code == 200 and res_json.get("ok"):
+            print(">> [성공] 텔레그램 알림 발송 완료!")
         else:
-            print(f">> [실패] 텔레그램 응답 에러: {res.text}")
+            print(f">> [발송 실패] 텔레그램 API 응답: {res.text}")
     except Exception as e:
-        print(f">> [에러] 텔레그램 전송 중 예외 발생: {e}")
+        print(f">> [에러] 전송 중 예외 발생: {e}")
 
 
 # -------------------------------------------------------------
@@ -118,7 +119,7 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 3. 신호 판별 및 브리핑 발송
+# 3. 신호 판별 및 HTML 브리핑 발송
 # -------------------------------------------------------------
 def analyze_and_broadcast(data: dict):
     macro_score = data["Macro_Score"]
@@ -133,47 +134,47 @@ def analyze_and_broadcast(data: dict):
 
     if macro_score >= 50.0 and vol_score >= 45.0:
         if macro_score >= 65.0 and vix1d >= 40.0:
-            status_title = "🚨 [극단적 위기] 전량 헤지 발동 (SH 50% + SGOV 50%)"
+            status_title = "🚨 <b>[극단적 위기] 전량 헤지 발동 (SH 50% + SGOV 50%)</b>"
             target_alloc = "QQQ: 0% | SGOV: 50% | SH: 50%"
             action_desc = "대세 하락/패닉 국면. QQQ 전량 매도 후 SH 인버스 헤지 편입."
         else:
-            status_title = "⚠️ [위험 경보] 안전자산 대기 (SGOV 100%)"
+            status_title = "⚠️ <b>[위험 경보] 안전자산 대기 (SGOV 100%)</b>"
             target_alloc = "QQQ: 0% | SGOV: 100% | SH: 0%"
             action_desc = "스트레스 가중. QQQ 청산 후 초단기채(SGOV)로 안전 대기."
     elif vix1d_turned:
-        status_title = "🎯 [저점 매수 1차] VIX1D 극단 피크아웃"
+        status_title = "🎯 <b>[저점 매수 1차] VIX1D 극단 피크아웃</b>"
         target_alloc = "QQQ: 40% | SGOV: 60% | SH: 0%"
         action_desc = f"VIX1D({vix1d_prev} → {vix1d}) 고점 꺾임. 1차 바닥 40% 분할 선진입."
     elif pcr_turned and macro_score < 55.0:
-        status_title = "🎯 [저점 매수 2차] 옵션 공포 완화 확인"
+        status_title = "🎯 <b>[저점 매수 2차] 옵션 공포 완화 확인</b>"
         target_alloc = "QQQ: 80% | SGOV: 20% | SH: 0%"
         action_desc = "PCR 하향 안정화. QQQ 비중 80%로 확대."
     else:
-        status_title = "✅ [정상 운용] Risk-On 포지션 유지"
+        status_title = "✅ <b>[정상 운용] Risk-On 포지션 유지</b>"
         target_alloc = "QQQ: 100% | SGOV: 0% | SH: 0%"
         action_desc = "지표 안정권. QQQ 100% 보유 유지."
 
     msg = f"""
-*{status_title}*
-📅 *기준일자:* {data['Date']} (QQQ: ${data['QQQ_Close']} / {data['QQQ_Ret_1D']}%)
+{status_title}
+📅 <b>기준일자:</b> {data['Date']} (QQQ: ${data['QQQ_Close']} / {data['QQQ_Ret_1D']}%)
 
-📊 *14개 핵심 지표 현황*
-• 매크로 스트레스 스코어: `{data['Macro_Score']}/100`
-• 단기 변동성 경보 스코어: `{data['Vol_Score']}/100`
-• VIX / VIX1D: `{data['VIX']}` / `{data['VIX1D']}` (전일: {data['VIX1D_Prev']})
-• 풋/콜 비율 (PCR): `{data['PCR']}` (전일: {data['PCR_Prev']})
-• 미국 10년물 금리: `{data['US10Y']}%` (5일 ROC: {data['US10Y_ROC5']}%)
+📊 <b>14개 핵심 지표 현황</b>
+• 매크로 스트레스 스코어: <code>{data['Macro_Score']}/100</code>
+• 단기 변동성 경보 스코어: <code>{data['Vol_Score']}/100</code>
+• VIX / VIX1D: <code>{data['VIX']}</code> / <code>{data['VIX1D']}</code> (전일: {data['VIX1D_Prev']})
+• 풋/콜 비율 (PCR): <code>{data['PCR']}</code> (전일: {data['PCR_Prev']})
+• 미국 10년물 금리: <code>{data['US10Y']}%</code> (5일 ROC: {data['US10Y_ROC5']}%)
 
-🎯 *목표 비중:* `{target_alloc}`
-💡 *운용 가이드:* {action_desc}
+🎯 <b>목표 비중:</b> <code>{target_alloc}</code>
+💡 <b>운용 가이드:</b> {action_desc}
 
 ──────────────────
-🌍 *국가별 실전 주문 가이드 (KST)*
-• 🇰🇷 *한국장 (09:05~):* 국내 나스닥100 ETF / 달러SOFR 교체
-• 🇯🇵 *일본장 (09:05~):* TSE 1545 / 2621 포지션 조정
-• 🇺🇸 *미국장 (22:30~):* QQQ 본주 / SGOV / SH 시초가(MOO) 집행
+🌍 <b>국가별 실전 주문 가이드 (KST)</b>
+• 🇰🇷 <b>한국장 (09:05~):</b> 국내 나스닥100 ETF / 달러SOFR 교체
+• 🇯🇵 <b>일본장 (09:05~):</b> TSE 1545 / 2621 포지션 조정
+• 🇺🇸 <b>미국장 (22:30~):</b> QQQ 본주 / SGOV / SH 시초가(MOO) 집행
 ──────────────────
-📁 _지표 데이터가 history_db.csv에 누적되었습니다._
+📁 <i>지표 데이터가 history_db.csv에 누적되었습니다.</i>
 """
     send_telegram_message(msg.strip())
 
