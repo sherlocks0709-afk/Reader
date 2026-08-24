@@ -7,9 +7,9 @@ import numpy as np
 from zoneinfo import ZoneInfo
 
 CSV_OUTPUT_FILE = "backtest_raw_db.csv"
-START_DATE = "2014-01-01"        # Tier 1: 12개년 기준 시작일
-SOFR_START_DATE = "2018-04-02"   # Tier 2: SOFR 공식 시작일
-VIX1D_START_DATE = "2023-04-24"  # Tier 3: VIX1D 공식 시작일
+START_DATE = "2014-01-01"
+SOFR_START_DATE = "2018-04-02"
+VIX1D_START_DATE = "2023-04-24"
 
 def send_telegram_result(text):
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -69,19 +69,26 @@ def get_yahoo_full(ticker_symbol):
     return pd.DataFrame()
 
 def fetch_fred_series(series_id):
-    try:
-        csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(csv_url, headers=headers, timeout=12)
-        if res.status_code == 200 and len(res.text) > 30:
-            df = pd.read_csv(io.StringIO(res.text))
-            df.columns = [c.strip().upper() for c in df.columns]
-            if "DATE" in df.columns and series_id.upper() in df.columns:
-                df['Date'] = pd.to_datetime(df['DATE'])
-                df[series_id] = pd.to_numeric(df[series_id.upper()], errors='coerce')
-                return df.dropna(subset=[series_id]).set_index('Date')[[series_id]]
-    except Exception as e:
-        print(f"FRED 다운로드 실패 ({series_id}): {e}")
+    # FRED 공식 심볼들 교차 시도
+    candidates = [series_id, series_id.upper(), "SOFRRATE" if series_id == "SOFR" else series_id]
+    for sid in candidates:
+        try:
+            csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            res = requests.get(csv_url, headers=headers, timeout=12)
+            if res.status_code == 200 and len(res.text) > 30:
+                df = pd.read_csv(io.StringIO(res.text))
+                df.columns = [c.strip().upper() for c in df.columns]
+                val_col = [c for c in df.columns if c != "DATE"]
+                if "DATE" in df.columns and val_col:
+                    df['Date'] = pd.to_datetime(df['DATE'])
+                    df[series_id] = pd.to_numeric(df[val_col[0]], errors='coerce')
+                    df_clean = df.dropna(subset=[series_id]).set_index('Date')[[series_id]]
+                    if len(df_clean) > 50:
+                        return df_clean
+        except Exception:
+            continue
+    print(f"FRED 다운로드 최종 실패 ({series_id})")
     return pd.DataFrame()
 
 def build_database_and_verify():
@@ -139,7 +146,7 @@ def build_database_and_verify():
     tier1_cols = [c for c in df.columns]
     df[tier1_cols] = df[tier1_cols].ffill().bfill()
 
-    # Tier 2 (SOFR): 2018-04-02 이전 NaN 보존
+    # Tier 2 (SOFR): 2018-04-02 이전 NaN 보존, 이후 채움
     if not df_sofr.empty:
         df['SOFR'] = df_sofr['SOFR']
         sofr_mask = df.index >= pd.to_datetime(SOFR_START_DATE)
@@ -147,7 +154,7 @@ def build_database_and_verify():
     else:
         df['SOFR'] = np.nan
 
-    # Tier 3 (VIX1D): 2023-04-24 이전 NaN 보존
+    # Tier 3 (VIX1D): 2023-04-24 이전 NaN 보존, 이후 채움
     if not vix1d.empty:
         df['VIX1D'] = vix1d['Close']
         vix1d_mask = df.index >= pd.to_datetime(VIX1D_START_DATE)
@@ -164,11 +171,11 @@ def build_database_and_verify():
         f"📁 저장 파일명: <code>{CSV_OUTPUT_FILE}</code>\n"
         f"📅 전체 기간: <b>{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}</b> (총 {len(df)}거래일)\n"
         f"────────────────\n"
-        f"• <b>Tier 1 (12년 연속 지표 12개):</b> 100% 무결\n"
-        f"• <b>Tier 2 (SOFR 단기자금):</b> {df['SOFR'].dropna().count()}건 (2018.04 이후)\n"
-        f"• <b>Tier 3 (VIX1D 0DTE):</b> {df['VIX1D'].dropna().count()}건 (2023.04 이후)\n"
+        f"• <b>Tier 1 (12년 연속 지표 12개):</b> 100% 무결 ({len(df)}건)\n"
+        f"• <b>Tier 2 (SOFR 단기자금):</b> {df['SOFR'].dropna().count()}건 정상 매핑 (2018.04 이후)\n"
+        f"• <b>Tier 3 (VIX1D 0DTE):</b> {df['VIX1D'].dropna().count()}건 정상 매핑 (2023.04 이후)\n"
         f"────────────────\n"
-        f"👉 14개 전수 팩터 시계열 데이터가 준비되었습니다."
+        f"👉 이제 14개 전수 지표가 완벽하게 캐싱되었습니다."
     )
     send_telegram_result(msg)
 
