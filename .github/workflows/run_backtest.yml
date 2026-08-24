@@ -1,16 +1,21 @@
-name: Run Perfect Walkforward Backtest
+name: Daily Macro Alert & DB Update
 
 on:
-  workflow_dispatch:
+  schedule:
+    # 한국 시간 화~토 아침 06:15 (UTC 월~금 21:15)
+    - cron: '15 21 * * 1-5'
+  workflow_dispatch: # 수동 실행 버튼 활성화
 
+# CSV 파일 커밋 및 푸시 권한 부여 (필수)
 permissions:
   contents: write
 
 jobs:
   run-analysis:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -18,22 +23,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          pip install pandas numpy requests
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy requests
 
-      - name: Run DB Generator
-        run: |
-          python perfect_walkforward_backtest.py
+      - name: Run Alert Script
         env:
+          # Settings > Secrets and variables > Actions 에 등록된 시크릿 매핑
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python daily_macro_alert.py
 
-      - name: Commit and Push DB
+      - name: Commit and push history_db.csv
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add backtest_raw_db.csv
-          git commit -m "📦 Save backtest_raw_db.csv [automated]" || echo "No changes to commit"
-          git push
+          git add history_db.csv
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update history_db.csv [skip ci]" && git push)
