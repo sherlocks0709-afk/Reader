@@ -2,7 +2,6 @@ import datetime
 import os
 import re
 import io
-import time
 import requests
 import pandas as pd
 import numpy as np
@@ -12,7 +11,6 @@ from urllib3.util.retry import Retry
 
 DB_FILE = "history_db.csv"
 
-# ── 네트워크 세션 생성 (Cloudflare 차단 및 일시적 타임아웃 3회 자동 재시도) ──
 def create_retry_session():
     session = requests.Session()
     retries = Retry(
@@ -90,8 +88,6 @@ def update_and_verify_local_db(record_dict):
     return warnings, len(db_df)
 
 def check_fomc_event_risk(target_date):
-    """FOMC 금리 결정 당일 및 D-1 이벤트 위험 감지"""
-    # 2026년 공식 FOMC 발표일 (현지시간 기준)
     fomc_dates_2026 = [
         datetime.date(2026, 1, 28),
         datetime.date(2026, 3, 18),
@@ -343,8 +339,6 @@ def calculate_ultra_risk_score():
     regime_alerts = []
 
     expected_trading_date = get_last_us_trading_date()
-
-    # FOMC 이벤트 리스크 체크
     fomc_banner_text = check_fomc_event_risk(expected_trading_date)
 
     # 1. 시세 및 변동성 수집
@@ -427,6 +421,16 @@ def calculate_ultra_risk_score():
     qqq_ref = float(qqq_close.iloc[-20]) if len(qqq_close) >= 20 else current_close
     qqq_20d_ret = ((current_close / qqq_ref) - 1) * 100
 
+    # ── [미세튜닝 2] 장기 횡보장 50/200일선 수평(슬로프) 휴면 모드 검증 ──
+    sma50_prev5 = float(sma50_s.iloc[-6]) if len(sma50_s) >= 6 else sma50
+    sma200_prev5 = float(sma200_s.iloc[-6]) if len(sma200_s) >= 6 else sma200
+    sma50_slope = ((sma50 / sma50_prev5) - 1) * 100
+    sma200_slope = ((sma200 / sma200_prev5) - 1) * 100
+    is_longterm_flat = (abs(sma50_slope) <= 0.20 and abs(sma200_slope) <= 0.20)
+    flat_market_tag = ""
+    if is_longterm_flat and drawdown > -10.0:
+        flat_market_tag = " (💤장기 횡보 박스권 휴면 모드 ➔ 레버리지 노출 최소화)"
+
     # 1-1. 200일 이격 Z (7.5점)
     disp_mean = float(disp200_s.mean())
     disp_std = float(disp200_s.std())
@@ -458,6 +462,7 @@ def calculate_ultra_risk_score():
     # 1-4. SKEW (7.0점)
     score_skew = float(np.clip((skew_current - 120) * (7.0 / 25), 0, 7.0))
     vix1d_tag = ""
+    ratio_0dte = 0.0
     if len(vix1d_close_s) >= 5 and vix_current_val > 0:
         ratio_0dte = vix1d_val / vix_current_val
         if ratio_0dte >= 1.25:
@@ -466,6 +471,12 @@ def calculate_ultra_risk_score():
             if ratio_0dte >= 1.40:
                 regime_alerts.append(f"0DTE 변동성 괴리 극대화 (VIX1D/VIX = {ratio_0dte:.2f}x)")
     skew_status = ("🚨 꼬리위험 급증" if skew_current >= 140 else "🟢 정상") + vix1d_tag
+
+    # ── [미세튜닝 1] 꼬리위험 극대화 이중 익절 보호장치 감지 ──
+    is_extreme_tail_risk = (skew_current >= 145.0 and ratio_0dte >= 1.35)
+    tail_risk_tag = ""
+    if is_extreme_tail_risk:
+        tail_risk_tag = " (⚡SKEW 145+ 및 0DTE 1.35x 동시 충족 ➔ 레버리지 15% 추가 익절 보호)"
 
     # 1-5. 기간구조 (6.0점)
     if np.isnan(vix3m_val) or vix3m_val <= 0: vix3m_val = vix_current_val * 1.1
@@ -647,7 +658,7 @@ def calculate_ultra_risk_score():
     elif hammer_reversal: flow_status = f"💎 <b>[밑꼬리 반등 핀바]</b> 저가 매수세 방어"
     else: flow_status = f"🟢 <b>[수급 정상]</b> 거래량 비율: {vol_ratio:.2f}x"
 
-    # ── [4단계] 동적 포지션 사이징 & 보완 모듈 ──
+    # ── [4단계] 동적 포지션 사이징 & 2대 미세튜닝 통합 ──
     tr1 = qqq_df['High'] - qqq_df['Low']
     tr2 = (qqq_df['High'] - qqq_df['Close'].shift(1)).abs()
     tr3 = (qqq_df['Low'] - qqq_df['Close'].shift(1)).abs()
@@ -661,6 +672,10 @@ def calculate_ultra_risk_score():
         vol_cap = 0.75
         vol_cap_tag = f" (🔥고변동성 장세 ATR {atr_pct:.1f}% ➔ 기본 비중 75% 캡 제한)"
 
+    # [미세튜닝 2] 장기 횡보장 시 레버리지 노출 자동 50% 축소 캡 적용
+    if is_longterm_flat and drawdown > -10.0:
+        vol_cap = min(vol_cap, 0.50)
+
     is_climax_run = (disp_20 >= 108.0)
     climax_tag = ""
     if is_climax_run and total_score < 65:
@@ -668,6 +683,11 @@ def calculate_ultra_risk_score():
 
     target_tqqq_pos = 1.0 * vol_cap
     target_kr2x_pos = 1.0 * vol_cap
+
+    # [미세튜닝 1] 극단적 꼬리위험 감지 시 레버리지 15% 추가 익절 보호
+    if is_extreme_tail_risk:
+        target_kr2x_pos = min(target_kr2x_pos, 0.85)
+        target_tqqq_pos = min(target_tqqq_pos, 0.85)
 
     if fut_gap_severe:
         qqq_action = "🟢 <b>[안정 국면]</b> 1배수는 노이즈 무시하고 100% 홀딩"
@@ -716,6 +736,12 @@ def calculate_ultra_risk_score():
             kr2x_action = "⚖️ <b>[과열 랠리 홀딩]</b> 5일선 지지 지속. 2배수 100% 유지"
             tqqq_action = "⚖️ <b>[과열 랠리 홀딩]</b> 5일선 지지 지속. 3배수 100% 유지"
             target_kr2x_pos, target_tqqq_pos = 1.0 * vol_cap, 1.0 * vol_cap
+    elif is_extreme_tail_risk:
+        qqq_action = "🚀 <b>[극단적 꼬리위험 감지]</b> QQQ 100% 홀딩 유지"
+        kr2x_action = "⚡ <b>[SKEW/0DTE 극단적 꼬리위험 보호]</b> 👉 <b>국내 2배수 15% 선제 익절 (KOFR 파킹)</b>"
+        tqqq_action = "⚡ <b>[SKEW/0DTE 극단적 꼬리위험 보호]</b> 👉 <b>TQQQ 15% 선제 익절 (SGOV 파킹)</b>"
+        target_kr2x_pos = 0.85 * vol_cap
+        target_tqqq_pos = 0.85 * vol_cap
     elif is_climax_run:
         qqq_action = "🚀 <b>[단기 이격 과열]</b> QQQ 100% 홀딩 유지"
         kr2x_action = "⚡ <b>[20일 이격 과열 분할 익절]</b> 👉 <b>국내 2배수 15% 선제 익절 (KOFR 15% 파킹)</b>"
@@ -740,7 +766,7 @@ def calculate_ultra_risk_score():
         tqqq_action = "🟢 <b>[안정 추세 순항]</b> TQQQ 100% 포지션 유지"
         target_kr2x_pos, target_tqqq_pos = 1.0 * vol_cap, 1.0 * vol_cap
 
-    # ── [보완③] 바닥 탐색 모드 & 데드캣 바운스 필터 ──
+    # ── [바닥 탐색 모드 & 데드캣 바운스 필터] ──
     bottom_section = ""
     if drawdown <= -10.0:
         vix_sma5 = vix_close_s.rolling(5).mean()
@@ -818,10 +844,7 @@ def calculate_ultra_risk_score():
         'Target_Pos': round(target_tqqq_pos, 2)
     }
 
-    # 직전 거래일 레코드 조회
     prev_db_rec, db_total_days = get_previous_day_record(str(qqq_d))
-
-    # 자체 DB 갱신 및 자동 치유
     db_warnings, db_total_days = update_and_verify_local_db(current_record)
     if db_warnings:
         data_warnings.extend(db_warnings)
@@ -861,14 +884,14 @@ def calculate_ultra_risk_score():
     kst_now_str = get_kst_now().strftime('%Y-%m-%d %H:%M')
 
     report = (
-        f"📊 <b>[나스닥 1배·2배·3배 4단계 정밀 판독기 (MDD 최적화)]</b>\n"
+        f"📊 <b>[나스닥 1배·2배·3배 4단계 정밀 판독기 (미세튜닝 2중방어 탑재)]</b>\n"
         f"📅 기준(KST): {kst_now_str} (자체DB: {db_total_days}일 누적)\n\n"
         f"{warning_banner}"
         f"{fomc_banner}"
         f"{regime_banner}"
         f"{fut_gap_status}"
         f"💰 <a href='https://finance.yahoo.com/quote/QQQ'>QQQ 종가 ({date_tag})</a>: <b>${current_close:.2f}</b>{d_qqq} (고점 대비: <b>{drawdown:+.1f}%</b>)\n"
-        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b>{d_tqqq} | ATR(14): <b>{atr_pct:.2f}%</b>{vol_cap_tag}{climax_tag}\n"
+        f"🔥 <a href='https://finance.yahoo.com/quote/TQQQ'>TQQQ 종가 ({date_tag})</a>: <b>${current_tqqq:.2f}</b>{d_tqqq} | ATR(14): <b>{atr_pct:.2f}%</b>{vol_cap_tag}{climax_tag}{tail_risk_tag}{flat_market_tag}\n"
         f"   └ QQQ 5일선: ${sma5:.2f} | 20일선: ${sma20:.2f} (20일 이격: {disp_20:.1f}%) | 50일선: ${sma50:.2f}\n"
         f"────────────────\n"
         f"🎯 <b>1단계 매크로 점수: {total_score} / 100점</b>{d_score}\n"
@@ -916,7 +939,6 @@ def send_telegram_message(text):
             print("텔레그램 전송 성공!")
         else:
             print(f"텔레그램 전송 실패: {res.status_code}, {res.text}")
-            # HTML 파싱 에러 시 일반 텍스트로 안전 2차 전송 시도
             if "can't parse entities" in res.text:
                 plain_text = re.sub(r'<[^>]+>', '', text)
                 payload["text"] = plain_text
