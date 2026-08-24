@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 
 # -------------------------------------------------------------
-# 1. 텔레그램 환경 변수 및 DB 경로
+# 1. 텔레그램 환경 변수 및 DB 설정
 # -------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -16,9 +16,9 @@ DB_FILE_PATH = "history_db.csv"
 
 
 def send_telegram_message(message: str):
-    """HTML 모드로 텔레그램 메시지 발송"""
+    """HTML 모드로 안정적인 텔레그램 메시지 발송"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[주의] 텔레그램 환경 변수 미설정으로 콘솔에 출력합니다.")
+        print("[주의] 텔레그램 환경 변수가 설정되지 않아 콘솔 출력으로 대체합니다.")
         print(message)
         return
 
@@ -34,7 +34,7 @@ def send_telegram_message(message: str):
         if res.status_code == 200 and res_json.get("ok"):
             print(">> [성공] 텔레그램 알림 발송 완료!")
         else:
-            print(f">> [발송 실패] 텔레그램 응답: {res.text}")
+            print(f">> [발송 실패] 텔레그램 API 응답: {res.text}")
     except Exception as e:
         print(f">> [에러] 전송 예외 발생: {e}")
 
@@ -90,7 +90,7 @@ class YahooDirectFetcher:
 
 
 # -------------------------------------------------------------
-# 3. 14개 지표 산출 모듈
+# 3. 14개 지표 산출 및 보정된 스코어링 모듈
 # -------------------------------------------------------------
 def fetch_and_calculate_indicators() -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -107,19 +107,17 @@ def fetch_and_calculate_indicators() -> dict:
     if qqq.empty:
         raise ValueError("야후 파이낸스에서 QQQ 원본 데이터를 읽어오지 못했습니다.")
 
-    # 1~3. QQQ 가격 및 추세/변동성
     qqq_close = float(qqq.iloc[-1])
     qqq_ret_1d = float(qqq.pct_change().iloc[-1] * 100) if len(qqq) > 1 else 0.0
     sma60 = float(qqq.rolling(60).mean().iloc[-1]) if len(qqq) >= 60 else qqq_close
     disparity_60 = float((qqq_close / sma60 - 1) * 100)
     hv5 = float(qqq.pct_change().rolling(5).std().iloc[-1] * np.sqrt(252) * 100) if len(qqq) >= 5 else 15.0
 
-    # 4~6. 변동성 지표
     vix_val = float(vix.iloc[-1]) if not vix.empty else 16.0
     vix1d_val = float(vix1d.iloc[-1]) if not vix1d.empty else vix_val
+    vix1d_prev = float(vix1d.iloc[-2]) if len(vix1d) > 1 else vix1d_val
     vix_ratio = float(vix1d_val / vix_val) if vix_val != 0 else 1.0
 
-    # 7~9. 금리, 환율, 신용 스프레드
     tnx_val = float(tnx.iloc[-1]) if not tnx.empty else 4.2
     tnx_roc5 = float((tnx.iloc[-1] / tnx.iloc[-5] - 1) * 100) if len(tnx) >= 5 else 0.0
     dxy_val = float(dxy.iloc[-1]) if not dxy.empty else 103.5
@@ -127,13 +125,12 @@ def fetch_and_calculate_indicators() -> dict:
     tlt_val = float(tlt.iloc[-1]) if not tlt.empty else 90.0
     hyg_tlt_ratio = float(hyg_val / tlt_val) if tlt_val != 0 else 0.83
 
-    # 10~12. 매크로 유동성 및 파생 지표
     tga_level = 750.0
     rrp_level = 350.0
     pcr_val = 0.95
     futures_basis = 0.15
 
-    # 13~14. 종합 위험 스코어링 (0~100)
+    # 스코어링 (0~100)
     disparity_stress = max(0.0, -disparity_60) * 4.0
     rate_stress = max(0.0, tnx_roc5) * 3.0
     credit_stress = max(0.0, (0.9 - hyg_tlt_ratio)) * 40.0
@@ -164,10 +161,9 @@ def fetch_and_calculate_indicators() -> dict:
 
 
 # -------------------------------------------------------------
-# 4. DB 로드, 직전 영업일 비교 및 최신화
+# 4. DB 로드 및 누적
 # -------------------------------------------------------------
 def get_prev_business_day_data(today_str: str):
-    """DB에서 오늘 이전 가장 최근 직전 영업일 레코드 조회"""
     if not os.path.exists(DB_FILE_PATH):
         return None
     try:
@@ -176,7 +172,7 @@ def get_prev_business_day_data(today_str: str):
         if not db_past.empty:
             return db_past.iloc[-1].to_dict()
     except Exception as e:
-        print(f">> DB 조회 중 오류: {e}")
+        print(f">> DB 조회 오류: {e}")
     return None
 
 
@@ -193,17 +189,22 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 5. 지표 포맷팅 및 브리핑 발송
+# 5. 가독성 극대화 포맷터 및 브리핑 발송
 # -------------------------------------------------------------
-def fmt_diff(curr, prev, unit="", is_rate=False):
-    """전일 대비 증감 텍스트 생성 포맷터"""
+def fmt_row(label: str, curr, prev, unit="", is_rate=False) -> str:
+    """한 줄씩 보기 좋게 정렬하는 포맷터"""
     if prev is None:
-        return f"<code>{curr}{unit}</code>"
-    diff = curr - prev
-    sign = "+" if diff > 0 else ""
-    if is_rate:
-        return f"<code>{curr}{unit}</code> ({sign}{diff:.2f}%p)"
-    return f"<code>{curr}{unit}</code> ({sign}{diff:.2f})"
+        diff_str = "-"
+    else:
+        diff = curr - prev
+        sign = "+" if diff > 0 else ""
+        if is_rate:
+            diff_str = f"{sign}{diff:.2f}%p"
+        else:
+            diff_str = f"{sign}{diff:.2f}"
+    
+    val_str = f"{curr}{unit}"
+    return f"• {label:<16}: <code>{val_str:<9}</code> ({diff_str})"
 
 
 def analyze_and_broadcast(data: dict, prev: dict = None):
@@ -219,71 +220,80 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
 
     if macro_score >= 50.0 and vol_score >= 45.0:
         if macro_score >= 65.0 and vix1d >= 40.0:
-            status_title = "🚨 <b>[극단적 위기] 전량 헤지 발동</b>"
-            us_guide = "QQQ: 0% | SGOV: 50% | SH: 50%"
-            kr_guide = "국내 나스닥: 0% | 달러SOFR: 100%"
+            header_icon = "🚨"
+            status_title = "극단적 위기 (전량 인버스/초단기채 헤지)"
+            us_guide = "QQQ 0% | SGOV 50% | SH 50%"
+            kr_guide = "국내 나스닥 0% | 달러SOFR 100%"
             action_desc = "대세 하락 패닉. 주식 전량 매도 및 SH 인버스 헤지 편입."
         else:
-            status_title = "⚠️ <b>[위험 경보] 안전자산 대기</b>"
-            us_guide = "QQQ: 0% | SGOV: 100% | SH: 0%"
-            kr_guide = "국내 나스닥: 0% | 달러SOFR: 100%"
-            action_desc = "스트레스 상승. 전량 매도 후 초단기채(SGOV) 이자 수취 대기."
+            header_icon = "⚠️"
+            status_title = "위험 경보 (안전자산 대기)"
+            us_guide = "QQQ 0% | SGOV 100% | SH 0%"
+            kr_guide = "국내 나스닥 0% | 달러SOFR 100%"
+            action_desc = "스트레스 가중. 전량 매도 후 초단기채(SGOV)로 안전 대기."
 
     elif vix1d_turned:
-        status_title = "⚡ <b>[저점 매수 1차] TQQQ 스나이핑 발동</b>"
-        us_guide = "<b>TQQQ: 30%</b> | QQQ: 30% | SGOV: 40%"
-        kr_guide = "국내 나스닥(1배): 40% | 달러SOFR: 60%"
+        header_icon = "⚡"
+        status_title = "저점 매수 1차 (미국 TQQQ 스나이핑)"
+        us_guide = "TQQQ 30% | QQQ 30% | SGOV 40%"
+        kr_guide = "국내 나스닥 40% | 달러SOFR 60%"
         action_desc = f"VIX1D({vix1d_prev} → {vix1d}) 피크아웃. 미국 TQQQ 30% 바닥 1차 선진입."
 
     elif pcr_turned and macro_score < 55.0:
-        status_title = "🚀 <b>[저점 매수 2차] 반등 가속화</b>"
-        us_guide = "<b>TQQQ: 30%</b> | QQQ: 50% | SGOV: 20%"
-        kr_guide = "국내 나스닥(1배): 80% | 달러SOFR: 20%"
+        header_icon = "🚀"
+        status_title = "저점 매수 2차 (반등 탄력 확대)"
+        us_guide = "TQQQ 30% | QQQ 50% | SGOV 20%"
+        kr_guide = "국내 나스닥 80% | 달러SOFR 20%"
         action_desc = "PCR 공포 완화 확인. QQQ 및 국내 1배수 비중 추가 확대."
 
     else:
-        status_title = "✅ <b>[정상 운용] Risk-On (1배수 정상화)</b>"
-        us_guide = "QQQ: 100% | TQQQ: 0% | SGOV: 0%"
-        kr_guide = "국내 나스닥(1배): 100%"
-        action_desc = "지표 안정권 유지. TQQQ 전량 QQQ 1배수로 롤오버."
+        header_icon = "✅"
+        status_title = "정상 운용 (Risk-On / 1배수 유지)"
+        us_guide = "QQQ 100% | TQQQ 0% | SGOV 0%"
+        kr_guide = "국내 나스닥(1배) 100%"
+        action_desc = "지표 안정권. QQQ 1배수 100% 보유 유지."
 
-    prev_date_str = f"(전일: {prev['Date']})" if prev else "(최초 누적)"
+    prev_date_str = f"vs {prev['Date']}" if prev else "Initial"
+
+    p_d = prev if prev else {}
 
     msg = f"""
-{status_title}
-📅 <b>기준일자:</b> {data['Date']} {prev_date_str}
-📈 <b>QQQ 종가:</b> ${data['QQQ_Close']} (<b>{data['QQQ_Ret_1D']:+}%</b>)
+{header_icon} <b>[SYSTEM ALERT] {status_title}</b>
+━━━━━━━━━━━━━━━━━━
+📅 <b>기준일자:</b> {data['Date']} (<code>{prev_date_str}</code>)
+📈 <b>QQQ 종가:</b> <code>${data['QQQ_Close']}</code> (<b>{data['QQQ_Ret_1D']:+}%</b>)
 
-📊 <b>14개 핵심 매크로/변동성 지표 현황</b>
-<b>[가격 & 추세]</b>
-• QQQ 60일 이격도: {fmt_diff(data['Disparity_60'], prev.get('Disparity_60') if prev else None, '%', True)}
-• QQQ 5일 실현변동성(HV5): {fmt_diff(data['HV5'], prev.get('HV5') if prev else None, '%', True)}
+📊 <b>핵심 리스크 종합 스코어</b>
+{fmt_row('매크로 스트레스', data['Macro_Score'], p_d.get('Macro_Score'), '/100')}
+{fmt_row('단기 변동성 경보', data['Vol_Score'], p_d.get('Vol_Score'), '/100')}
 
-<b>[변동성 & 파생]</b>
-• VIX: {fmt_diff(data['VIX'], prev.get('VIX') if prev else None)}
-• VIX1D (초단기): {fmt_diff(data['VIX1D'], prev.get('VIX1D') if prev else None)}
-• VIX 비율 (1D/30D): {fmt_diff(data['VIX_Ratio'], prev.get('VIX_Ratio') if prev else None)}
-• 풋/콜 비율 (PCR): {fmt_diff(data['PCR'], prev.get('PCR') if prev else None)}
-• 선물 베이시스: {fmt_diff(data['Futures_Basis'], prev.get('Futures_Basis') if prev else None, 'pt')}
+📈 <b>가격 & 추세 지표</b>
+{fmt_row('60일선 이격도', data['Disparity_60'], p_d.get('Disparity_60'), '%', True)}
+{fmt_row('5일 실현변동성', data['HV5'], p_d.get('HV5'), '%', True)}
 
-<b>[금리 & 환율 & 신용]</b>
-• 미국 10년물 금리: {fmt_diff(data['US10Y'], prev.get('US10Y') if prev else None, '%', True)}
-• 10년물 금리 5일 ROC: {fmt_diff(data['US10Y_ROC5'], prev.get('US10Y_ROC5') if prev else None, '%')}
-• 달러 인덱스 (DXY): {fmt_diff(data['DXY'], prev.get('DXY') if prev else None)}
-• 하이일드 비율 (HYG/TLT): {fmt_diff(data['HYG_TLT_Ratio'], prev.get('HYG_TLT_Ratio') if prev else None)}
+⚡ <b>변동성 & 파생 시장</b>
+{fmt_row('VIX (30D)', data['VIX'], p_d.get('VIX'))}
+{fmt_row('VIX1D (1D)', data['VIX1D'], p_d.get('VIX1D'))}
+{fmt_row('VIX 비율(1D/30D)', data['VIX_Ratio'], p_d.get('VIX_Ratio'))}
+{fmt_row('풋/콜 비율(PCR)', data['PCR'], p_d.get('PCR'))}
+{fmt_row('선물 베이시스', data['Futures_Basis'], p_d.get('Futures_Basis'), 'pt')}
 
-<b>[유동성 & 종합 스코어]</b>
-• TGA / RRP 잔고: <code>${data['TGA_Level']}B</code> / <code>${data['RRP_Level']}B</code>
-• 매크로 스트레스 스코어: {fmt_diff(data['Macro_Score'], prev.get('Macro_Score') if prev else None, '/100')}
-• 단기 변동성 경보 스코어: {fmt_diff(data['Vol_Score'], prev.get('Vol_Score') if prev else None, '/100')}
+💵 <b>금리 & 환율 & 유동성</b>
+{fmt_row('미국 10년물 금리', data['US10Y'], p_d.get('US10Y'), '%', True)}
+{fmt_row('10년물 5일 ROC', data['US10Y_ROC5'], p_d.get('US10Y_ROC5'), '%')}
+{fmt_row('달러 인덱스', data['DXY'], p_d.get('DXY'))}
+{fmt_row('HYG/TLT 비율', data['HYG_TLT_Ratio'], p_d.get('HYG_TLT_Ratio'))}
+• TGA / RRP 잔고   : <code>${data['TGA_Level']}B / ${data['RRP_Level']}B</code>
 
+━━━━━━━━━━━━━━━━━━
 🎯 <b>목표 포트폴리오 비중</b>
-• 🇺🇸 <b>미국 직투:</b> <code>{us_guide}</code>
-• 🇰🇷 <b>국내 계좌:</b> <code>{kr_guide}</code>
+🇺🇸 <b>미국 직투:</b> <code>{us_guide}</code>
+🇰🇷 <b>국내 계좌:</b> <code>{kr_guide}</code>
 
-💡 <b>운용 가이드:</b> {action_desc}
-──────────────────
-📁 <i>지표 데이터가 history_db.csv에 누적되었습니다.</i>
+💡 <b>운용 가이드:</b>
+<i>{action_desc}</i>
+━━━━━━━━━━━━━━━━━━
+📁 <i>Data logged to history_db.csv</i>
 """
     send_telegram_message(msg.strip())
 
