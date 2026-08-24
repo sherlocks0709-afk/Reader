@@ -6,8 +6,6 @@ import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
 
-RAW_DB_FILE = "longterm_peak_db.csv"
-
 def send_telegram_result(text):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -15,15 +13,17 @@ def send_telegram_result(text):
         print("텔레그램 토큰 미설정으로 콘솔에만 출력합니다.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"}
     try:
-        res = requests.post(url, data=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"텔레그램 전송 에러: {res.text}")
+        res = requests.post(url, data=payload, timeout=15)
+        if res.status_code == 200:
+            print("✅ 텔레그램 전송 성공!")
+        else:
+            print(f"🚨 텔레그램 전송 에러 ({res.status_code}): {res.text}")
     except Exception as e:
-        print(f"텔레그램 전송 실패: {e}")
+        print(f"텔레그램 통신 실패: {e}")
 
-def get_historical_data(ticker_symbol, start_date="2012-01-01"):
+def get_historical_data(ticker_symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=15y&interval=1d"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
@@ -51,12 +51,12 @@ def get_historical_data(ticker_symbol, start_date="2012-01-01"):
                 df['Low'] = df['Low'].fillna(df['Close'])
                 df['Volume'] = df['Volume'].fillna(1.0)
                 df.set_index('Date', inplace=True)
-                return df[df.index >= pd.to_datetime(start_date)].astype(float)
+                return df.astype(float)
     except Exception as e:
         print(f"데이터 수집 에러 ({ticker_symbol}): {e}")
     return pd.DataFrame()
 
-def fetch_fred_historical(series_id, api_key="", start_date="2012-01-01"):
+def fetch_fred_historical(series_id):
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -72,56 +72,32 @@ def fetch_fred_historical(series_id, api_key="", start_date="2012-01-01"):
         pass
     return pd.DataFrame()
 
-def load_or_build_longterm_db():
-    if os.path.exists(RAW_DB_FILE):
-        try:
-            print(f"📦 [장기 DB 로드] '{RAW_DB_FILE}'에서 14개년 시계열 데이터를 불러옵니다.")
-            df = pd.read_csv(RAW_DB_FILE)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
-            if len(df) > 2000:
-                return df
-        except Exception as e:
-            print(f"DB 로드 실패, 재생성 진행: {e}")
-
-    print("🌐 [신규 14년 DB 구축] 2012년 이후 전수 데이터를 다운로드하여 DB를 생성합니다...")
+def run_analysis():
+    print("🌐 [14년 시계열 데이터 수집 중...]")
     qqq = get_historical_data("QQQ")
     vix = get_historical_data("^VIX")
-    vix3m = get_historical_data("^VIX3M")
-    vxn = get_historical_data("^VXN")
     skew = get_historical_data("^SKEW")
     hyg = get_historical_data("HYG")
     tlt = get_historical_data("TLT")
     df_hy = fetch_fred_historical("BAMLH0A0HYM2")
 
+    if qqq.empty:
+        print("🚨 QQQ 데이터 수집 실패로 중단")
+        return
+
     df = pd.DataFrame({
-        'QQQ_Close': qqq['Close'] if not qqq.empty else pd.Series(dtype=float),
-        'QQQ_Open': qqq['Open'] if not qqq.empty else pd.Series(dtype=float),
-        'QQQ_High': qqq['High'] if not qqq.empty else pd.Series(dtype=float),
-        'QQQ_Low': qqq['Low'] if not qqq.empty else pd.Series(dtype=float),
-        'QQQ_Vol': qqq['Volume'] if not qqq.empty else pd.Series(dtype=float)
+        'QQQ_Close': qqq['Close'], 'QQQ_Open': qqq['Open'],
+        'QQQ_High': qqq['High'], 'QQQ_Low': qqq['Low'], 'QQQ_Vol': qqq['Volume']
     })
     
     df['VIX'] = vix['Close'] if not vix.empty else 18.0
-    df['VIX3M'] = vix3m['Close'] if not vix3m.empty else (df['VIX'] * 1.1)
-    df['VXN'] = vxn['Close'] if not vxn.empty else (df['VIX'] * 1.1)
     df['SKEW'] = skew['Close'] if not skew.empty else 125.0
     df['HYG'] = hyg['Close'] if not hyg.empty else 75.0
     df['TLT'] = tlt['Close'] if not tlt.empty else 90.0
     df['HY_SPREAD'] = df_hy['BAMLH0A0HYM2'] if not df_hy.empty else 3.5
 
     df = df.ffill().bfill().dropna()
-    df.to_csv(RAW_DB_FILE)
-    print(f"✅ '{RAW_DB_FILE}' 생성 완료 ({len(df)}거래일)")
-    return df
-
-def analyze_historical_major_peaks():
-    df = load_or_build_longterm_db()
-    if df.empty or len(df) < 500:
-        print("🚨 DB 데이터 수집 실패로 중단합니다.")
-        return
-
-    print(f"📊 [검증 시작] 총 {len(df)}거래일 (2012 ~ 2026) 다중 경로 고점 검증 가동...")
+    print(f"📊 총 {len(df)}거래일 데이터 준비 완료. 다중 경로 고점 감지 시작...")
 
     qqq_c = df['QQQ_Close']
     qqq_v = df['QQQ_Vol']
@@ -148,31 +124,31 @@ def analyze_historical_major_peaks():
         d_curr = df.index[i]
         curr_p = float(qqq_c.iloc[i])
 
-        # ── 경로 1: 클라이맥스 버블형 ──
+        # 1. 클라이맥스 버블형
         cond_bubble = (
             (disp200.iloc[i] >= 106.0 or disp20.iloc[i] >= 105.0) and
-            (float(df['SKEW'].iloc[i]) >= 135.0 or float(df['VIX'].iloc[i]) >= 19.0) and
+            (float(df['SKEW'].iloc[i]) >= 135.0 or float(df['VIX'].iloc[i]) >= 18.5) and
             (curr_p < float(sma5.iloc[i])) and
             (float(macd.iloc[i]) < float(signal.iloc[i]))
         )
 
-        # ── 경로 2: 크레딧/자금 균열형 ──
+        # 2. 크레딧/스프레드 균열형
         hy_chg_20d = float(df['HY_SPREAD'].iloc[i]) - float(df['HY_SPREAD'].iloc[i-20])
         r_now = float(df['HYG'].iloc[i]) / float(df['TLT'].iloc[i])
         r_prev = float(df['HYG'].iloc[i-20]) / float(df['TLT'].iloc[i-20])
         hyg_tlt_drop = ((r_now / r_prev) - 1) * 100
 
         cond_credit = (
-            (hy_chg_20d >= 0.20 or hyg_tlt_drop <= -2.0) and
+            (hy_chg_20d >= 0.15 or hyg_tlt_drop <= -1.8) and
             (curr_p < float(sma20.iloc[i])) and
             (float(macd.iloc[i]) < float(signal.iloc[i]))
         )
 
-        # ── 경로 3: 모멘텀 구조 붕괴형 (블랙스완/50일선 이탈) ──
+        # 3. 50일선 붕괴 모멘텀 이탈형
         cond_breakdown = (
             (curr_p < float(sma50.iloc[i])) and
             (curr_p < float(sma20.iloc[i])) and
-            (vol_ratio.iloc[i] >= 1.15)
+            (vol_ratio.iloc[i] >= 1.10)
         )
 
         trigger_reason = ""
@@ -196,22 +172,24 @@ def analyze_historical_major_peaks():
     drop_over_5 = (peak_df['max_drop_60d'] <= -5.0).sum()
 
     msg = (
-        f"🏛️ <b>[14개년 다중 경로 고점 판독 전수 검증 결과]</b>\n"
+        f"🏛️ <b>[14개년 다중 경로 고점 판독 전수 검증]</b>\n"
         f"📅 기간: {df.index[50].strftime('%Y-%m-%d')} ~ {df.index[-60].strftime('%Y-%m-%d')} ({len(df)}거래일)\n"
         f"────────────────\n"
         f"• <b>총 감지된 고점 신호:</b> <b>{len(peak_df)}회</b>\n"
-        f"• <b>실제 -10% 이상 대형 폭락 적중:</b> <b>{drop_over_10}회</b>\n"
-        f"• <b>실제 -5% 이상 조정 포함 적중:</b> <b>{drop_over_5}회</b>\n"
-        f"• <b>고점 신호 후 평균 낙폭:</b> <b>{peak_df['max_drop_60d'].mean():.2f}%</b>\n"
+        f"• <b>🚨 -10% 이상 대형 폭락 적중:</b> <b>{drop_over_10}회</b>\n"
+        f"• <b>⚠️ -5% 이상 일반 조정 적중:</b> <b>{drop_over_5}회</b>\n"
+        f"• <b>신호 후 실제 평균 낙폭:</b> <b>{peak_df['max_drop_60d'].mean():.2f}%</b>\n"
         f"────────────────\n"
-        f"<b>[역사적 주요 감지 로그]</b>\n"
+        f"<b>[역사적 주요 대형 폭락(-10% 이상) 적중 로그]</b>\n"
     )
-    for _, r in peak_df.iterrows():
-        status = "🚨 대형폭락(-10%이상)" if r['max_drop_60d'] <= -10.0 else "⚠️ 일반조정"
-        msg += f"• <b>{r['date'].strftime('%Y-%m-%d')}</b>: ${r['price']:.2f} [{r['reason']}] ➔ 낙폭: <b>{r['max_drop_60d']}%</b> {status}\n"
+    
+    # -10% 이상 대형 폭락 건만 압축 출력 (메시지 길이 방어)
+    major_hits = peak_df[peak_df['max_drop_60d'] <= -10.0]
+    for _, r in major_hits.iterrows():
+        msg += f"• <b>{r['date'].strftime('%Y-%m-%d')}</b> (${r['price']:.1f}) [{r['reason']}] ➔ 낙폭: <b>{r['max_drop_60d']}%</b>\n"
 
     print(msg)
     send_telegram_result(msg)
 
 if __name__ == "__main__":
-    analyze_historical_major_peaks()
+    run_analysis()
