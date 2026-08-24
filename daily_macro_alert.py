@@ -6,7 +6,7 @@ import requests
 import yfinance as yf
 
 # -------------------------------------------------------------
-# 1. 텔레그램 환경 변수 로드 (변수명 다변화 대응)
+# 1. 텔레그램 환경 변수 및 DB 경로 설정
 # -------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -38,7 +38,7 @@ def send_telegram_message(message: str):
 
 
 # -------------------------------------------------------------
-# 2. 14개 지표 산출 및 DB 축적
+# 2. 14개 지표 산출 및 보정된 스코어링 모듈
 # -------------------------------------------------------------
 def fetch_and_calculate_indicators() -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -54,33 +54,41 @@ def fetch_and_calculate_indicators() -> dict:
     hyg = raw["HYG"].dropna() if "HYG" in raw else pd.Series(75.0, index=qqq.index)
     tlt = raw["TLT"].dropna() if "TLT" in raw else pd.Series(92.0, index=qqq.index)
 
+    # 지표 1: QQQ 가격 및 당일 등락률
     qqq_close = float(qqq.iloc[-1])
     qqq_ret_1d = float(qqq.pct_change().iloc[-1] * 100)
 
+    # 지표 2~4: 변동성 및 초단기 변동성 스프레드
     vix_val = float(vix.iloc[-1])
     vix1d_val = float(vix1d.iloc[-1])
     vix1d_prev = float(vix1d.iloc[-2]) if len(vix1d) > 1 else vix1d_val
     vix_ratio = float(vix1d_val / vix_val) if vix_val != 0 else 1.0
 
+    # 지표 5~6: 국채 금리 속도 및 달러 지수
     tnx_val = float(tnx.iloc[-1])
     tnx_roc5 = float((tnx.iloc[-1] / tnx.iloc[-5] - 1) * 100) if len(tnx) >= 5 else 0.0
     dxy_val = float(dxy.iloc[-1])
-    hyg_tlt_ratio = float(hyg.iloc[-1] / tlt.iloc[-1]) if tlt.iloc[-1] != 0 else 1.0
 
+    # 지표 7~9: 하이일드 비율, 60일 이평 이격도, 실현 변동성
+    hyg_tlt_ratio = float(hyg.iloc[-1] / tlt.iloc[-1]) if tlt.iloc[-1] != 0 else 1.0
     sma60 = float(qqq.rolling(60).mean().iloc[-1])
     disparity_60 = float((qqq_close / sma60 - 1) * 100)
     hv5 = float(qqq.pct_change().rolling(5).std().iloc[-1] * np.sqrt(252) * 100)
 
-    # 매크로/옵션 보조 지표
+    # 지표 10~14: 매크로 유동성 및 파생 시장 지표
     tga_level = 750.0
     rrp_level = 350.0
     pcr_val = 0.95
     pcr_prev = 1.02
     futures_basis = 0.15
 
-    # 스코어링 (0~100)
-    macro_score = min(100.0, max(0.0, (4.5 - hyg_tlt_ratio) * 20 + (tnx_roc5 * 2.5) + (100 - disparity_60 * 2)))
-    vol_score = min(100.0, max(0.0, (vix1d_val * 1.2) + (vix_ratio * 20) + (hv5 * 0.8)))
+    # 스코어링 보정 (0~100)
+    disparity_stress = max(0.0, -disparity_60) * 4.0
+    rate_stress = max(0.0, tnx_roc5) * 3.0
+    credit_stress = max(0.0, (0.9 - hyg_tlt_ratio)) * 40.0
+    macro_score = min(100.0, max(0.0, 15.0 + disparity_stress + rate_stress + credit_stress))
+
+    vol_score = min(100.0, max(0.0, (vix1d_val * 1.2) + (max(0.0, vix_ratio - 1.0) * 30.0) + (hv5 * 0.6)))
 
     return {
         "Date": today_str,
@@ -106,6 +114,9 @@ def fetch_and_calculate_indicators() -> dict:
     }
 
 
+# -------------------------------------------------------------
+# 3. CSV DB 누적 저장
+# -------------------------------------------------------------
 def save_to_history_db(data_dict: dict):
     new_row = pd.DataFrame([data_dict])
     if os.path.exists(DB_FILE_PATH):
@@ -119,7 +130,7 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 3. 신호 판별 및 HTML 브리핑 발송
+# 4. 미국 TQQQ 스나이핑 전용 신호 판별 및 브리핑 발송
 # -------------------------------------------------------------
 def analyze_and_broadcast(data: dict):
     macro_score = data["Macro_Score"]
@@ -134,25 +145,38 @@ def analyze_and_broadcast(data: dict):
 
     if macro_score >= 50.0 and vol_score >= 45.0:
         if macro_score >= 65.0 and vix1d >= 40.0:
-            status_title = "🚨 <b>[극단적 위기] 전량 헤지 발동 (SH 50% + SGOV 50%)</b>"
-            target_alloc = "QQQ: 0% | SGOV: 50% | SH: 50%"
-            action_desc = "대세 하락/패닉 국면. QQQ 전량 매도 후 SH 인버스 헤지 편입."
+            status_title = "🚨 <b>[극단적 위기] 전량 헤지 (인버스 편입)</b>"
+            us_guide = "QQQ: 0% | SGOV: 50% | SH(인버스): 50%"
+            kr_guide = "국내 나스닥100: 0% | 미국달러SOFR: 100%"
+            jp_guide = "1545: 0% | 단기채/현금: 100%"
+            action_desc = "대세 하락 패닉. 주식 전량 매도 및 인버스 헤지 편입."
         else:
-            status_title = "⚠️ <b>[위험 경보] 안전자산 대기 (SGOV 100%)</b>"
-            target_alloc = "QQQ: 0% | SGOV: 100% | SH: 0%"
-            action_desc = "스트레스 가중. QQQ 청산 후 초단기채(SGOV)로 안전 대기."
+            status_title = "⚠️ <b>[위험 경보] 안전자산 대기 (초단기채)</b>"
+            us_guide = "QQQ: 0% | SGOV: 100% | SH: 0%"
+            kr_guide = "국내 나스닥100: 0% | 미국달러SOFR: 100%"
+            jp_guide = "1545: 0% | 단기채/현금: 100%"
+            action_desc = "스트레스 상승. 전량 매도 후 초단기채 이자 수취 대기."
+
     elif vix1d_turned:
-        status_title = "🎯 <b>[저점 매수 1차] VIX1D 극단 피크아웃</b>"
-        target_alloc = "QQQ: 40% | SGOV: 60% | SH: 0%"
-        action_desc = f"VIX1D({vix1d_prev} → {vix1d}) 고점 꺾임. 1차 바닥 40% 분할 선진입."
+        status_title = "⚡ <b>[저점 매수 1차] 미국 TQQQ 스나이핑 발동</b>"
+        us_guide = "<b>TQQQ(3배): 30%</b> | QQQ(1배): 30% | SGOV: 40%"
+        kr_guide = "국내 나스닥100(1배): 40% | 미국달러SOFR: 60%"
+        jp_guide = "1545(1배): 40% | 현금: 60%"
+        action_desc = f"VIX1D({vix1d_prev} → {vix1d}) 피크아웃. 미국 TQQQ 30% 바닥 1차 선진입."
+
     elif pcr_turned and macro_score < 55.0:
-        status_title = "🎯 <b>[저점 매수 2차] 옵션 공포 완화 확인</b>"
-        target_alloc = "QQQ: 80% | SGOV: 20% | SH: 0%"
-        action_desc = "PCR 하향 안정화. QQQ 비중 80%로 확대."
+        status_title = "🚀 <b>[저점 매수 2차] 반등 가속화 (비중 확대)</b>"
+        us_guide = "<b>TQQQ(3배): 30%</b> | QQQ(1배): 50% | SGOV: 20%"
+        kr_guide = "국내 나스닥100(1배): 80% | 미국달러SOFR: 20%"
+        jp_guide = "1545(1배): 80% | 현금: 20%"
+        action_desc = "PCR 공포 완화 확인. QQQ 및 국내 1배수 비중 추가 확대."
+
     else:
-        status_title = "✅ <b>[정상 운용] Risk-On 포지션 유지</b>"
-        target_alloc = "QQQ: 100% | SGOV: 0% | SH: 0%"
-        action_desc = "지표 안정권. QQQ 100% 보유 유지."
+        status_title = "✅ <b>[정상 운용] Risk-On (1배수 정상화)</b>"
+        us_guide = "QQQ: 100% | TQQQ: 0% | SGOV: 0%"
+        kr_guide = "국내 나스닥100(1배): 100%"
+        jp_guide = "1545(1배): 100%"
+        action_desc = "지표 안정권 유지. TQQQ 전량 QQQ 1배수로 롤오버."
 
     msg = f"""
 {status_title}
@@ -164,21 +188,29 @@ def analyze_and_broadcast(data: dict):
 • VIX / VIX1D: <code>{data['VIX']}</code> / <code>{data['VIX1D']}</code> (전일: {data['VIX1D_Prev']})
 • 풋/콜 비율 (PCR): <code>{data['PCR']}</code> (전일: {data['PCR_Prev']})
 • 미국 10년물 금리: <code>{data['US10Y']}%</code> (5일 ROC: {data['US10Y_ROC5']}%)
+• 60일선 이격도: <code>{data['Disparity_60']}%</code>
 
-🎯 <b>목표 비중:</b> <code>{target_alloc}</code>
+🎯 <b>국가별 최적 목표 포트폴리오</b>
+🇺🇸 <b>미국 시장:</b> <code>{us_guide}</code>
+🇰🇷 <b>한국 시장:</b> <code>{kr_guide}</code>
+🇯🇵 <b>일본 시장:</b> <code>{jp_guide}</code>
+
 💡 <b>운용 가이드:</b> {action_desc}
 
 ──────────────────
 🌍 <b>국가별 실전 주문 가이드 (KST)</b>
-• 🇰🇷 <b>한국장 (09:05~):</b> 국내 나스닥100 ETF / 달러SOFR 교체
-• 🇯🇵 <b>일본장 (09:05~):</b> TSE 1545 / 2621 포지션 조정
-• 🇺🇸 <b>미국장 (22:30~):</b> QQQ 본주 / SGOV / SH 시초가(MOO) 집행
+• 🇰🇷 <b>한국장 (09:05~):</b> 국내 나스닥100 1배 ETF / 달러SOFR 비중 조절
+• 🇯🇵 <b>일본장 (09:05~):</b> TSE 1545 / 단기채 비중 조절
+• 🇺🇸 <b>미국장 (22:30~):</b> QQQ / TQQQ / SGOV 시초가(MOO) 또는 분할 집행
 ──────────────────
 📁 <i>지표 데이터가 history_db.csv에 누적되었습니다.</i>
 """
     send_telegram_message(msg.strip())
 
 
+# -------------------------------------------------------------
+# 5. 메인 실행 진입점
+# -------------------------------------------------------------
 if __name__ == "__main__":
     data = fetch_and_calculate_indicators()
     save_to_history_db(data)
