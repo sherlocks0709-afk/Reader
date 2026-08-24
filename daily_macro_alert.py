@@ -1,12 +1,13 @@
 from datetime import datetime
 import os
+import traceback
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
 # -------------------------------------------------------------
-# 1. 텔레그램 환경 변수 및 DB 경로 설정
+# 1. 텔레그램 환경 변수 로드
 # -------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -16,7 +17,7 @@ DB_FILE_PATH = "history_db.csv"
 def send_telegram_message(message: str):
     """HTML 모드로 안전하게 텔레그램 메시지 발송"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[주의] 텔레그램 환경 변수가 설정되지 않아 콘솔 출력으로 대체합니다.")
+        print("[주의] 텔레그램 환경 변수 미설정으로 콘솔에 출력합니다.")
         print(message)
         return
 
@@ -32,57 +33,76 @@ def send_telegram_message(message: str):
         if res.status_code == 200 and res_json.get("ok"):
             print(">> [성공] 텔레그램 알림 발송 완료!")
         else:
-            print(f">> [발송 실패] 텔레그램 API 응답: {res.text}")
+            print(f">> [발송 실패] 텔레그램 응답: {res.text}")
     except Exception as e:
-        print(f">> [에러] 전송 중 예외 발생: {e}")
+        print(f">> [에러] 전송 예외 발생: {e}")
 
 
 # -------------------------------------------------------------
-# 2. 14개 지표 산출 및 보정된 스코어링 모듈
+# 2. 안전한 데이터 수집 및 14개 지표 산출
 # -------------------------------------------------------------
+def get_ticker_series(ticker: str, period="3mo") -> pd.Series:
+    """개별 티커의 종가 시리즈를 안전하게 추출 (MultiIndex/결측 방지)"""
+    try:
+        df = yf.download(ticker, period=period, interval="1d", progress=False)
+        if df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            if "Close" in df.columns.levels[0]:
+                return df["Close"][ticker].dropna()
+            return df.iloc[:, 0].dropna()
+        if "Close" in df.columns:
+            return df["Close"].dropna()
+        return df.iloc[:, 0].dropna()
+    except Exception as e:
+        print(f">> [{ticker}] 데이터 수집 실패: {e}")
+        return pd.Series(dtype=float)
+
+
 def fetch_and_calculate_indicators() -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    tickers = ["QQQ", "^VIX", "^VIX1D", "^TNX", "DX-Y.NYB", "HYG", "TLT"]
-    raw = yf.download(tickers, period="3mo", interval="1d", progress=False)["Close"]
+    # 개별 안전 다운로드
+    qqq = get_ticker_series("QQQ")
+    vix = get_ticker_series("^VIX")
+    vix1d = get_ticker_series("^VIX1D")
+    tnx = get_ticker_series("^TNX")
+    dxy = get_ticker_series("DX-Y.NYB")
+    hyg = get_ticker_series("HYG")
+    tlt = get_ticker_series("TLT")
 
-    qqq = raw["QQQ"].dropna()
-    vix = raw["^VIX"].dropna() if "^VIX" in raw else pd.Series(18.0, index=qqq.index)
-    vix1d = raw["^VIX1D"].dropna() if "^VIX1D" in raw else pd.Series(18.0, index=qqq.index)
-    tnx = raw["^TNX"].dropna() if "^TNX" in raw else pd.Series(4.2, index=qqq.index)
-    dxy = raw["DX-Y.NYB"].dropna() if "DX-Y.NYB" in raw else pd.Series(104.0, index=qqq.index)
-    hyg = raw["HYG"].dropna() if "HYG" in raw else pd.Series(75.0, index=qqq.index)
-    tlt = raw["TLT"].dropna() if "TLT" in raw else pd.Series(92.0, index=qqq.index)
+    # QQQ 필수값 확인 (실패 시 기본 예외 처리)
+    if qqq.empty:
+        raise ValueError("QQQ 데이터를 불러오지 못했습니다.")
 
-    # 지표 1: QQQ 가격 및 당일 등락률
     qqq_close = float(qqq.iloc[-1])
-    qqq_ret_1d = float(qqq.pct_change().iloc[-1] * 100)
+    qqq_ret_1d = float(qqq.pct_change().iloc[-1] * 100) if len(qqq) > 1 else 0.0
 
-    # 지표 2~4: 변동성 및 초단기 변동성 스프레드
-    vix_val = float(vix.iloc[-1])
-    vix1d_val = float(vix1d.iloc[-1])
+    vix_val = float(vix.iloc[-1]) if not vix.empty else 16.0
+    vix1d_val = float(vix1d.iloc[-1]) if not vix1d.empty else vix_val
     vix1d_prev = float(vix1d.iloc[-2]) if len(vix1d) > 1 else vix1d_val
     vix_ratio = float(vix1d_val / vix_val) if vix_val != 0 else 1.0
 
-    # 지표 5~6: 국채 금리 속도 및 달러 지수
-    tnx_val = float(tnx.iloc[-1])
+    tnx_val = float(tnx.iloc[-1]) if not tnx.empty else 4.2
     tnx_roc5 = float((tnx.iloc[-1] / tnx.iloc[-5] - 1) * 100) if len(tnx) >= 5 else 0.0
-    dxy_val = float(dxy.iloc[-1])
+    dxy_val = float(dxy.iloc[-1]) if not dxy.empty else 103.5
 
-    # 지표 7~9: 하이일드 비율, 60일 이평 이격도, 실현 변동성
-    hyg_tlt_ratio = float(hyg.iloc[-1] / tlt.iloc[-1]) if tlt.iloc[-1] != 0 else 1.0
-    sma60 = float(qqq.rolling(60).mean().iloc[-1])
+    hyg_val = float(hyg.iloc[-1]) if not hyg.empty else 75.0
+    tlt_val = float(tlt.iloc[-1]) if not tlt.empty else 90.0
+    hyg_tlt_ratio = float(hyg_val / tlt_val) if tlt_val != 0 else 0.83
+
+    sma60 = float(qqq.rolling(60).mean().iloc[-1]) if len(qqq) >= 60 else qqq_close
     disparity_60 = float((qqq_close / sma60 - 1) * 100)
-    hv5 = float(qqq.pct_change().rolling(5).std().iloc[-1] * np.sqrt(252) * 100)
+    hv5 = float(qqq.pct_change().rolling(5).std().iloc[-1] * np.sqrt(252) * 100) if len(qqq) >= 5 else 15.0
 
-    # 지표 10~14: 매크로 유동성 및 파생 시장 지표
+    # 보조 지표
     tga_level = 750.0
     rrp_level = 350.0
     pcr_val = 0.95
     pcr_prev = 1.02
     futures_basis = 0.15
 
-    # 스코어링 보정 (0~100)
+    # 스코어링
     disparity_stress = max(0.0, -disparity_60) * 4.0
     rate_stress = max(0.0, tnx_roc5) * 3.0
     credit_stress = max(0.0, (0.9 - hyg_tlt_ratio)) * 40.0
@@ -130,7 +150,7 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 4. 미국 TQQQ 스나이핑 전용 신호 판별 및 브리핑 발송
+# 4. 미국 TQQQ 스나이핑 신호 판별 및 브리핑 발송
 # -------------------------------------------------------------
 def analyze_and_broadcast(data: dict):
     macro_score = data["Macro_Score"]
@@ -209,9 +229,14 @@ def analyze_and_broadcast(data: dict):
 
 
 # -------------------------------------------------------------
-# 5. 메인 실행 진입점
+# 5. 메인 실행 루프 (예외 발생 시 로그 출력)
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    data = fetch_and_calculate_indicators()
-    save_to_history_db(data)
-    analyze_and_broadcast(data)
+    try:
+        data = fetch_and_calculate_indicators()
+        save_to_history_db(data)
+        analyze_and_broadcast(data)
+    except Exception as e:
+        print(f"FATAL ERROR 발생: {e}")
+        traceback.print_exc()
+        raise e
