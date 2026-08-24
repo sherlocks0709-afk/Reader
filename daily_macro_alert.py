@@ -1,5 +1,4 @@
 from datetime import datetime
-import json
 import math
 import os
 import time
@@ -58,7 +57,6 @@ class LiveMarketDataCollector:
         }
 
     def fetch_yahoo_df(self, ticker: str, range_str="3mo") -> pd.DataFrame:
-        """야후 파이낸스 차트 API로부터 OHLCV 안전 수집"""
         encoded = ticker.replace("^", "%5E").replace("=", "%3D")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={range_str}&interval=1d"
         for _ in range(3):
@@ -91,9 +89,7 @@ class LiveMarketDataCollector:
         return pd.DataFrame()
 
     def fetch_fred_liquidity(self) -> tuple:
-        """FRED 무료 엔드포인트에서 TGA 및 역레포(RRP) 잔고 실시간 수집 ($B)"""
         tga, rrp = 750.0, 350.0
-        # 1. TGA (Treasury General Account)
         try:
             url_tga = (
                 "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN"
@@ -101,13 +97,10 @@ class LiveMarketDataCollector:
             df_tga = pd.read_csv(url_tga)
             df_tga = df_tga[df_tga["WTREGEN"] != "."].dropna()
             if not df_tga.empty:
-                tga = round(
-                    float(df_tga.iloc[-1]["WTREGEN"]) / 1000.0, 1
-                )  # 백만$ -> 십억$(B)
+                tga = round(float(df_tga.iloc[-1]["WTREGEN"]) / 1000.0, 1)
         except Exception:
             pass
 
-        # 2. RRP (Overnight Reverse Repurchase Agreements)
         try:
             url_rrp = (
                 "https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD"
@@ -115,38 +108,38 @@ class LiveMarketDataCollector:
             df_rrp = pd.read_csv(url_rrp)
             df_rrp = df_rrp[df_rrp["RRPONTSYD"] != "."].dropna()
             if not df_rrp.empty:
-                rrp = round(
-                    float(df_rrp.iloc[-1]["RRPONTSYD"]), 1
-                )  # 이미 십억$(B) 단위
+                rrp = round(float(df_rrp.iloc[-1]["RRPONTSYD"]), 1)
         except Exception:
             pass
 
         return tga, rrp
 
-    def fetch_cboe_pcr(self) -> float:
-        """CBOE 공식 옵션 풋/콜 비율(PCR) 실시간 수집"""
+    def fetch_cboe_equity_pcr(self) -> float:
+        """CBOE 공식 개별주식 풋/콜 비율(Equity PCR) 실시간 수집"""
         try:
             url = "https://cdn.cboe.com/data/us/options/market_statistics/daily/current_market_statistics.csv"
             res = requests.get(url, timeout=7)
             if res.status_code == 200:
                 lines = res.text.split("\n")
                 for line in lines:
-                    if "TOTAL PUT/CALL RATIO" in line.upper():
-                        val = float(line.split(",")[-1].strip())
+                    line_upper = line.upper()
+                    # 순수 개별주식 풋콜비율 파싱
+                    if "EQUITY" in line_upper and "PUT/CALL RATIO" in line_upper:
+                        parts = line.split(",")
+                        val = float(parts[-1].strip())
                         return round(val, 2)
         except Exception:
             pass
-        return 0.95
+        return 0.65
 
 
 # -------------------------------------------------------------
-# 3. 14개 핵심 지표 산출 및 스코어링 모듈
+# 3. 14개 핵심 지표 산출 모듈
 # -------------------------------------------------------------
 def fetch_all_live_indicators(prev_record: dict = None) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     collector = LiveMarketDataCollector()
 
-    # 야후 파이낸스 실시간 수집
     qqq_df = collector.fetch_yahoo_df("QQQ")
     vix_df = collector.fetch_yahoo_df("^VIX")
     vix1d_df = collector.fetch_yahoo_df("^VIX1D")
@@ -154,7 +147,7 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
     tnx_df = collector.fetch_yahoo_df("^TNX")
     dxy_df = collector.fetch_yahoo_df("DX-Y.NYB")
     hyg_df = collector.fetch_yahoo_df("HYG")
-    tlt_df = collector.fetch_yahoo_df("TLT")
+    tlt_df = collector.fetch_history_df("TLT")
     nq_df = collector.fetch_yahoo_df("NQ=F")
 
     if qqq_df.empty:
@@ -166,7 +159,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         float(qqq.pct_change().iloc[-1] * 100) if len(qqq) > 1 else 0.0
     )
 
-    # 1. 가격 & 추세 지표
     sma60 = (
         float(qqq.rolling(60).mean().iloc[-1])
         if len(qqq) >= 60
@@ -179,7 +171,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         else 15.0
     )
 
-    # 2. 변동성 지표 (VIX, VXN, VIX1D 합성 복원)
     vix_val = (
         float(vix_df["Close"].iloc[-1]) if not vix_df.empty else 16.0
     )
@@ -187,11 +178,10 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         float(vxn_df["Close"].iloc[-1]) if not vxn_df.empty else 20.0
     )
 
-    # VIX1D 직접 수신 or 98% 정밀도 합성 복원
+    # VIX1D 합성 복원
     if not vix1d_df.empty and "Close" in vix1d_df.columns:
         vix1d_val = float(vix1d_df["Close"].iloc[-1])
     else:
-        # QQQ 당일 파킨슨 변동성 결합
         h, l = (
             float(qqq_df["High"].iloc[-1]),
             float(qqq_df["Low"].iloc[-1]),
@@ -210,7 +200,6 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         round(float(vix1d_val / vix_val), 2) if vix_val != 0 else 1.0
     )
 
-    # 3. 금리, 환율, 신용 스프레드
     tnx = tnx_df["Close"] if not tnx_df.empty else pd.Series(dtype=float)
     tnx_val = float(tnx.iloc[-1]) if not tnx.empty else 4.2
     tnx_roc5 = (
@@ -226,20 +215,20 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         round(float(hyg_val / tlt_val), 3) if tlt_val != 0 else 0.83
     )
 
-    # 4. 실시간 파생 및 유동성 지표
     tga_level, rrp_level = collector.fetch_fred_liquidity()
-    pcr_val = collector.fetch_cboe_pcr()
+    pcr_val = collector.fetch_cboe_equity_pcr()
 
-    # 나스닥 선물 베이시스 (NQ=F 선물종가 vs QQQ*40)
+    # 선물 베이시스 괴리율(%) 산출 (NQ 선물 vs QQQ*40)
     if not nq_df.empty:
         nq_close = float(nq_df["Close"].iloc[-1])
-        futures_basis = round(
-            float(nq_close - (qqq_close * 40.0)), 2
-        )  # 지수 포인트 단위 괴리
+        theoretical_ndx = qqq_close * 40.0
+        futures_basis_pct = round(
+            float((nq_close / theoretical_ndx - 1) * 100), 2
+        )
     else:
-        futures_basis = 0.15
+        futures_basis_pct = 0.05
 
-    # 5. 종합 위험 스코어링 (0~100)
+    # 스코어링 (0~100)
     disparity_stress = max(0.0, -disparity_60) * 4.0
     rate_stress = max(0.0, tnx_roc5) * 3.0
     credit_stress = max(0.0, (0.9 - hyg_tlt_ratio)) * 40.0
@@ -273,17 +262,16 @@ def fetch_all_live_indicators(prev_record: dict = None) -> dict:
         "TGA_Level": tga_level,
         "RRP_Level": rrp_level,
         "PCR": pcr_val,
-        "Futures_Basis": futures_basis,
+        "Futures_Basis": futures_basis_pct,
         "Macro_Score": round(macro_score, 1),
         "Vol_Score": round(vol_score, 1),
     }
 
 
 # -------------------------------------------------------------
-# 4. DB 로드 및 저장 (영구 누적)
+# 4. DB 로드 및 저장
 # -------------------------------------------------------------
 def get_prev_business_day_data(today_str: str):
-    """DB에서 오늘 이전의 가장 최근 영업일 레코드 조회"""
     if not os.path.exists(DB_FILE_PATH):
         return None
     try:
@@ -300,7 +288,6 @@ def save_to_history_db(data_dict: dict):
     new_row = pd.DataFrame([data_dict])
     if os.path.exists(DB_FILE_PATH):
         db = pd.read_csv(DB_FILE_PATH)
-        # 오늘 날짜 레코드가 이미 있으면 덮어쓰고, 없으면 추가
         db = db[db["Date"] != data_dict["Date"]]
         db = pd.concat([db, new_row], ignore_index=True)
     else:
@@ -310,7 +297,7 @@ def save_to_history_db(data_dict: dict):
 
 
 # -------------------------------------------------------------
-# 5. 안전한 포맷터 및 브리핑 발송 (nan 방어 완료)
+# 5. 포맷터 및 브리핑 발송
 # -------------------------------------------------------------
 def is_valid_num(val):
     if val is None:
@@ -323,7 +310,6 @@ def is_valid_num(val):
 
 
 def fmt_row(label: str, curr, prev, unit="", is_rate=False) -> str:
-    """수치와 증감량을 nan 없이 깔끔하게 포맷팅"""
     curr_valid = is_valid_num(curr)
     prev_valid = is_valid_num(prev)
 
@@ -364,9 +350,9 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
     )
 
     vix1d_turned = (vix1d_prev >= 35.0) and (vix1d < vix1d_prev)
-    pcr_turned = (pcr_prev >= 1.25) and (pcr < pcr_prev)
+    # 개별주식 PCR 피크아웃 조건 (1.00 초과 후 꺾임)
+    pcr_turned = (pcr_prev >= 1.00) and (pcr < pcr_prev)
 
-    # 1. 위기 및 경보 판정
     if macro_score >= 50.0 and vol_score >= 45.0:
         if macro_score >= 65.0 and vix1d >= 40.0:
             header_icon = "🚨"
@@ -385,24 +371,20 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
                 "스트레스 가중. 전량 매도 후 초단기채(SGOV)로 안전 대기."
             )
 
-    # 2. 바닥 스나이핑 판정
     elif vix1d_turned:
         header_icon = "⚡"
         status_title = "저점 매수 1차 (미국 TQQQ 스나이핑)"
         us_guide = "TQQQ 30% | QQQ 30% | SGOV 40%"
         kr_guide = "국내 나스닥 40% | 달러SOFR 60%"
-        action_desc = f"VIX1D({vix1d_prev} → {vix1d}) 피크아웃. 미국 TQQQ 30% 바닥 1차 선진입."
+        action_desc = f"VIX1D({vix1d_prev:.2f} → {vix1d:.2f}) 피크아웃. 미국 TQQQ 30% 바닥 1차 선진입."
 
     elif pcr_turned and macro_score < 55.0:
         header_icon = "🚀"
         status_title = "저점 매수 2차 (반등 탄력 확대)"
         us_guide = "TQQQ 30% | QQQ 50% | SGOV 20%"
         kr_guide = "국내 나스닥 80% | 달러SOFR 20%"
-        action_desc = (
-            "PCR 공포 완화 확인. QQQ 및 국내 1배수 비중 추가 확대."
-        )
+        action_desc = f"Equity PCR({pcr_prev} → {pcr}) 공포 완화 확인. QQQ 비중 추가 확대."
 
-    # 3. 휩쏘 방지 버퍼
     elif prev_macro >= 50.0 and macro_score >= 42.0:
         header_icon = "⏳"
         status_title = "재진입 대기 (휩쏘 방지 안착 관망)"
@@ -455,8 +437,8 @@ def analyze_and_broadcast(data: dict, prev: dict = None):
 {fmt_row('VIX (30D)', data['VIX'], p_d.get('VIX'))}
 {fmt_row('VIX1D (1D/합성)', data['VIX1D'], p_d.get('VIX1D'))}
 {fmt_row('VIX 비율(1D/30D)', data['VIX_Ratio'], p_d.get('VIX_Ratio'))}
-{fmt_row('풋/콜 비율(PCR)', data['PCR'], p_d.get('PCR'))}
-{fmt_row('선물 베이시스', data['Futures_Basis'], p_d.get('Futures_Basis'), 'pt')}
+{fmt_row('Equity PCR', data['PCR'], p_d.get('PCR'))}
+{fmt_row('선물 괴리율(Basis)', data['Futures_Basis'], p_d.get('Futures_Basis'), '%', True)}
 
 💵 <b>금리 & 환율 & 유동성</b>
 {fmt_row('미국 10년물 금리', data['US10Y'], p_d.get('US10Y'), '%', True)}
