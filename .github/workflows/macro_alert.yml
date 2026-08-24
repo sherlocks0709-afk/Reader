@@ -2,11 +2,9 @@ name: Daily Macro Alert & DB Update
 
 on:
   schedule:
-    # 한국 시간 화~토 아침 06:15 (UTC 월~금 21:15)
     - cron: '15 21 * * 1-5'
-  workflow_dispatch: # 수동 실행 버튼 활성화
+  workflow_dispatch:
 
-# CSV 파일 커밋 및 푸시 권한 부여 (필수)
 permissions:
   contents: write
 
@@ -30,7 +28,6 @@ jobs:
 
       - name: Run Alert Script
         env:
-          # Settings > Secrets and variables > Actions 에 등록된 시크릿 매핑
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -41,4 +38,9 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add history_db.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update history_db.csv [skip ci]" && git push)
+          if git diff --staged --quiet; then
+            echo "변경 사항이 없어 커밋을 건너뜁니다."
+          else
+            git commit -m "Update history_db.csv [skip ci]"
+            git push
+          fi
