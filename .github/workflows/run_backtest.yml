@@ -1,28 +1,16 @@
-name: Run Perfect Walkforward Backtest
-
-on:
-  workflow_dispatch:
-
-jobs:
-  walkforward-backtest:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 저장소 체크아웃
-        uses: actions/checkout@v4
-
-      - name: 파이썬 3.11 환경 구성
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 필수 라이브러리 설치
-        run: |
-          pip install pandas numpy requests
-
-      - name: 무결성 백테스트 실행
-        env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+- name: Run DB Generator
         run: |
           python perfect_walkforward_backtest.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+
+      # 👇 이 부분이 있어야 실행 후 내 GitHub 저장소 메인에 파일이 영구 저장됩니다.
+      - name: Commit and Push DB to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add backtest_raw_db.csv
+          git commit -m "📦 Auto-update backtest_raw_db.csv" || echo "No changes to commit"
+          git push
